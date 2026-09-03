@@ -557,7 +557,6 @@ static char *read_message(void) {
     static int cap = 0;
     int len = 0;
     int c;
-    int is_cl = 0;
     /* 探测 Content-Length 头 */
     {
         /* 读第一行判断 */
@@ -570,7 +569,6 @@ static char *read_message(void) {
             if (c != '\r') first[first_len++] = (char)c;
         }
         if (strncmp(first, "Content-Length:", 15) == 0) {
-            is_cl = 1;
             int body_len = atoi(first + 15);
             /* 跳过剩余头（直到空行） */
             int done = 0;
@@ -783,9 +781,29 @@ static DWORD WINAPI http_client_thread(LPVOID arg) {
     return 0;
 }
 
-static int http_main(int port, const char *token) {
+static DWORD g_parent_pid = 0;
+
+/* 父进程看护：--parent-pid 指定的进程（扩展 host）退出后本服务自动退出，
+   避免 VS Code 关闭/卸载/崩溃后留下占用端口的孤儿进程 */
+static DWORD WINAPI parent_watchdog(LPVOID arg) {
+    (void)arg;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, g_parent_pid);
+    if (!h) ExitProcess(1); /* 父进程已不存在，无需看护 */
+    for (;;) {
+        DWORD w = WaitForSingleObject(h, 2000);
+        if (w == WAIT_OBJECT_0) { CloseHandle(h); ExitProcess(0); } /* 父进程已退出 */
+        if (w == WAIT_FAILED) { CloseHandle(h); ExitProcess(1); }
+    }
+    return 0;
+}
+
+static int http_main(int port, const char *token, DWORD parent_pid) {
     g_http_mode = 1;
     g_token = token;
+    if (parent_pid) {
+        g_parent_pid = parent_pid;
+        CreateThread(NULL, 0, parent_watchdog, NULL, 0, NULL);
+    }
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "WSAStartup failed\n"); return 1; }
     SOCKET ls = socket(AF_INET, SOCK_STREAM, 0);
@@ -815,10 +833,12 @@ static int http_main(int port, const char *token) {
 int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "--http") == 0) {
         const char *token = NULL;
+        DWORD parent_pid = 0;
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) token = argv[i + 1];
+            else if (strcmp(argv[i], "--parent-pid") == 0 && i + 1 < argc) parent_pid = (DWORD)atol(argv[i + 1]);
         }
-        return http_main(atoi(argv[2]), token);
+        return http_main(atoi(argv[2]), token, parent_pid);
     }
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);

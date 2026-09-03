@@ -272,7 +272,7 @@ function startHttp(context) {
             vscode.window.showErrorMessage('WinExec MCP: 内置 exe 缺失 ' + exe);
             return;
         }
-        child = spawn(exe, ['--http', String(port), '--token', currentToken(cfg)], {
+        child = spawn(exe, ['--http', String(port), '--token', currentToken(cfg), '--parent-pid', String(process.pid)], {
             windowsHide: true,
             stdio: 'ignore'
         });
