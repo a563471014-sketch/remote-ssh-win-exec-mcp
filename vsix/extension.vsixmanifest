@@ -3,7 +3,7 @@
   <Metadata>
     <Identity Language="en-US" Id="win-exec-mcp" Version="0.3.1" Publisher="a563471014-sketch"/>
     <DisplayName>WinExec MCP</DisplayName>
-    <Description xml:space="preserve">Bridges Remote-SSH (Linux) AI agents to the Windows host: run any Windows command / CLI / script from a Linux-side agent (Copilot, Claude Code, …) and get stdout/stderr/exit code back. Generic MCP (stdio + HTTP) with auto-registration and SSH RemoteForward — not limited to embedded tooling.</Description>
+    <Description xml:space="preserve">Bridges Remote-SSH (Linux) AI agents to the Windows host: run any Windows command / CLI / script from a Linux-side agent (Copilot, Claude Code, …) and get stdout/stderr/exit code back. Generic MCP (stdio + HTTP) with auto-registration and SSH RemoteForward.</Description>
     <Tags>mcp,windows,agent,remote-ssh</Tags>
     <Categories>Other</Categories>
     <GalleryFlags>Public</GalleryFlags>

@@ -3,7 +3,7 @@
 Windows command execution MCP server for **Remote-SSH**: lets an AI agent
 running on the **Linux side** (Copilot, Claude Code, any MCP client) run
 commands on the **Windows client** and get stdout/stderr/exit code back — for
-any Windows command, CLI or script, not just embedded tooling.
+any Windows command, CLI or script.
 
 - Single C file → one self-contained exe (stdio + streamable-http dual mode)
 - VS Code extension: auto-registers MCP servers, auto-starts the HTTP service,
