@@ -6,4 +6,5 @@
   <Default Extension="c" ContentType="text/plain"/>
   <Default Extension="exe" ContentType="application/octet-stream"/>
   <Default Extension="md" ContentType="text/markdown"/>
+  <Default Extension="png" ContentType="image/png"/>
 </Types>

@@ -9,6 +9,7 @@
 	},
 	"license": "MIT",
 	"publisher": "a563471014-sketch",
+	"icon": "icon.png",
 	"engines": {
 		"vscode": "^1.90.0"
 	},
