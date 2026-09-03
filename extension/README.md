@@ -1,11 +1,11 @@
 # WinExec MCP
 
-自包含扩展（exe + 源码 + 自动配置）：在 **Remote-SSH 窗口**里让 AI agent 在 **Windows 客户端**执行命令，立即返回结果（stdout/stderr/exit code，UTF-8）。
+自包含扩展（exe + 源码 + 自动配置）：让 **Remote-SSH（Linux）端**运行的 AI agent（Copilot、Claude Code 等）在 **Windows 客户端**执行任意命令——CLI、脚本、Windows 特有命令、串口/硬件工具均可——立即返回 stdout/stderr/exit code（UTF-8）。不局限于嵌入式开发。
 
 ## 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.2.4.vsix
+code --install-extension win-exec-mcp-0.3.1.vsix
 ```
 
 → **Reload Window** → 弹"已更新"提示时**再点一次 Reload** → 无需任何手动配置。

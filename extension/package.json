@@ -1,7 +1,7 @@
 {
 	"name": "win-exec-mcp",
 	"displayName": "WinExec MCP",
-	"description": "Windows 命令执行 MCP（stdio 走 Remote-SSH 通道；http 用户级注册+自动连接；自动配置 SSH RemoteForward 让服务器本机工具经回环使用）",
+	"description": "为 Remote-SSH（Linux）端运行的 AI agent 提供 Windows 命令执行能力（MCP）：任何 Windows 命令/CLI/脚本皆可经安全通道调用并返回结果，不限于嵌入式开发；stdio/HTTP 双模式自动配置 + SSH RemoteForward 转发",
 	"version": "0.3.1",
 	"repository": {
 		"type": "git",

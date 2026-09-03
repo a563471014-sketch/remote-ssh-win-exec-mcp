@@ -1,8 +1,9 @@
 # win-exec-mcp
 
-Windows command execution MCP server for **Remote-SSH**: lets an AI agent in a
-Remote-SSH (Linux) window run commands on the **Windows client** (where the COM
-ports / hardware tools live), and get stdout/stderr/exit code back.
+Windows command execution MCP server for **Remote-SSH**: lets an AI agent
+running on the **Linux side** (Copilot, Claude Code, any MCP client) run
+commands on the **Windows client** and get stdout/stderr/exit code back — for
+any Windows command, CLI or script, not just embedded tooling.
 
 - Single C file → one self-contained exe (stdio + streamable-http dual mode)
 - VS Code extension: auto-registers MCP servers, auto-starts the HTTP service,
@@ -10,11 +11,12 @@ ports / hardware tools live), and get stdout/stderr/exit code back.
 
 ## Why
 
-In a Remote-SSH setup the agent runs on Linux, but many tools (esptool,
-flash.py, serial monitors…) only exist on the Windows client. This extension
-bridges the two: agent calls `windows_exec("...")`, the command executes on
-Windows, output returns over the MCP channel (optionally through the SSH
-encrypted tunnel).
+In a Remote-SSH setup the agent runs on Linux, but plenty of things only exist
+on the Windows client: Windows-only CLIs and scripts, serial/COM ports and
+hardware tools (esptool, adb, …), GUI-adjacent utilities, whatever else the
+Windows machine has and the Linux server doesn't. This extension bridges the
+two: agent calls `windows_exec("...")`, the command executes on Windows, output
+returns over the MCP channel (optionally through the SSH encrypted tunnel).
 
 ## Tool
 

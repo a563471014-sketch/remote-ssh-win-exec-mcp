@@ -521,8 +521,9 @@ static void handle_message(const char *line) {
         Json *t = j_obj();
         j_set(t, "name", j_str("windows_exec"));
         j_set(t, "description", j_str(
-            "在 Windows 客户端执行一条命令（Remote-SSH 环境专用，跑在用户电脑的 Windows 上）。"
-            "适合运行 adb、dir、ipconfig、PowerShell 等 Windows 命令；结果返回 stdout/stderr 和退出码。"
+            "在 Windows 客户端执行一条命令（供 Remote-SSH/Linux 端的 agent 调用，跑在用户电脑的 Windows 上）。"
+            "任何 Windows 命令/CLI/脚本皆可（如 dir、ipconfig、PowerShell、adb、esptool 等），不限于嵌入式场景；"
+            "结果返回 stdout/stderr 和退出码。"
             "参数: command(必填, Windows 命令字符串, 支持 && 和管道), timeout_ms(可选, 超时毫秒, 默认 30000)。"));
         Json *schema = j_obj();
         j_set(schema, "type", j_str("object"));
