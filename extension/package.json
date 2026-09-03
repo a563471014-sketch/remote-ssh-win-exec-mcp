@@ -5,10 +5,10 @@
 	"version": "0.3.1",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/yunengsheng/win-exec-mcp"
+		"url": "https://github.com/a563471014-sketch/win-exec-mcp"
 	},
 	"license": "MIT",
-	"publisher": "yunengsheng",
+	"publisher": "a563471014-sketch",
 	"engines": {
 		"vscode": "^1.90.0"
 	},
