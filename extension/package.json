@@ -1,6 +1,6 @@
 {
 	"name": "win-exec-mcp",
-	"displayName": "WinExec MCP",
+	"displayName": "WinExec MCP for Remote-SSH",
 	"description": "为 Remote-SSH（Linux）端运行的 AI agent 提供 Windows 命令执行能力（MCP）：任何 Windows 命令/CLI/脚本皆可经安全通道调用并返回 stdout/stderr/退出码；stdio/HTTP 双模式自动配置 + SSH RemoteForward 转发",
 	"version": "0.3.1",
 	"repository": {
