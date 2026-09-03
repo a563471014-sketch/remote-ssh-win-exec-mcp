@@ -1,0 +1,94 @@
+{
+	"name": "win-exec-mcp",
+	"displayName": "WinExec MCP",
+	"description": "Windows 命令执行 MCP（stdio 走 Remote-SSH 通道；http 用户级注册+自动连接；自动配置 SSH RemoteForward 让服务器本机工具经回环使用）",
+	"version": "0.3.1",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/yunengsheng/win-exec-mcp"
+	},
+	"license": "MIT",
+	"publisher": "yunengsheng",
+	"engines": {
+		"vscode": "^1.90.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"extensionKind": [
+		"ui"
+	],
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "./extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "winExecMcp.startHttp",
+				"title": "WinExec MCP: Start HTTP service"
+			},
+			{
+				"command": "winExecMcp.stopHttp",
+				"title": "WinExec MCP: Stop HTTP service"
+			},
+			{
+				"command": "winExecMcp.register",
+				"title": "WinExec MCP: Register user mcp.json"
+			},
+			{
+				"command": "winExecMcp.registerProject",
+				"title": "WinExec MCP: 注册到本项目 (.vscode/mcp.json)"
+			},
+			{
+				"command": "winExecMcp.unregisterProject",
+				"title": "WinExec MCP: 从本项目移除注册"
+			}
+		],
+		"configuration": {
+			"title": "WinExec MCP",
+			"properties": {
+				"winExecMcp.stdio.enabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "把内置 exe 以 stdio 模式注册到用户级 mcp.json（local 模式，Windows 客户端拉起，走 Remote-SSH 通道）"
+				},
+				"winExecMcp.http.enabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "HTTP 实例进程开关（仅远端窗口自动拉起）+ 自动连接（workbench.mcp.startServer '*'）"
+				},
+				"winExecMcp.http.port": {
+					"type": "number",
+					"default": 38848,
+					"description": "HTTP 监听端口"
+				},
+				"winExecMcp.http.token": {
+					"type": "string",
+					"default": "",
+					"description": "HTTP Bearer token（留空则首次激活自动生成随机 token 并持久化）"
+				},
+				"winExecMcp.http.host": {
+					"type": "string",
+					"default": "",
+					"description": "手动指定局域网 IP（多网卡/热点场景覆盖自动探测；留空则自动探测并跳过热点网段）"
+				},
+				"winExecMcp.ssh.localPort": {
+					"type": "number",
+					"default": 28848,
+					"description": "服务器本机回环端口（RemoteForward 127.0.0.1:<localPort> → Windows 127.0.0.1:<http.port>）"
+				},
+				"winExecMcp.ssh.autoForward": {
+					"type": "boolean",
+					"default": true,
+					"description": "远端窗口激活时自动在 ~/.ssh/config 追加 RemoteForward（服务器本机工具可经 127.0.0.1:<ssh.localPort> 使用，下次连接生效；只追加独立 Host 块，原配置先备份）"
+				},
+				"winExecMcp.project.autoRegister": {
+					"type": "boolean",
+					"default": true,
+					"description": "远端窗口激活时自动注册 http 条目到项目级 .vscode/mcp.json 和项目根 .mcp.json（Copilot + Claude Code 自动可用）"
+				}
+			}
+		}
+	}
+}
