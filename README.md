@@ -62,6 +62,14 @@ SSH RemoteForward (`winExecMcp.ssh.localPort`, default 28848 → Windows
 the Windows MCP over `http://127.0.0.1:28848/mcp` — traffic stays inside the
 SSH tunnel, no firewall/LAN-IP dependency.
 
+> **Which agent sees which server.** The **stdio** server is registered in
+> VS Code's own user-level `mcp.json` (a VS Code-specific format, incl.
+> `location: local`), so only VS Code built-in agents (Copilot Chat) see it —
+> third-party agents do not read that file. Any agent outside VS Code (Claude
+> Code, Cursor, …), whether on the server or elsewhere, should connect over
+> **http** instead: `http://127.0.0.1:28848/mcp` + the Bearer token (see the
+> project `.mcp.json` for a ready-made entry).
+
 ## Settings (`winExecMcp.*`)
 
 | key | default | meaning |
