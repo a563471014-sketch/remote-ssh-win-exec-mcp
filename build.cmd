@@ -4,7 +4,20 @@ rem NOTE: bump VER together with extension\package.json version
 setlocal
 cd /d "%~dp0"
 set VER=0.3.1
-set GCC=D:\Strawberry\c\bin\x86_64-w64-mingw32-gcc.exe
+
+rem ---- locate mingw gcc (first arg overrides; else PATH; else common installs) ----
+set GCC=%1
+if "%GCC%"=="" for %%g in (x86_64-w64-mingw32-gcc gcc) do (
+    if not defined GCC where %%g >nul 2>nul && set GCC=%%g
+)
+if "%GCC%"=="" if exist "D:\Strawberry\c\bin\x86_64-w64-mingw32-gcc.exe" set GCC=D:\Strawberry\c\bin\x86_64-w64-mingw32-gcc.exe
+if "%GCC%"=="" if exist "C:\msys64\mingw64\bin\x86_64-w64-mingw32-gcc.exe" set GCC=C:\msys64\mingw64\bin\x86_64-w64-mingw32-gcc.exe
+if "%GCC%"=="" if exist "C:\mingw64\bin\gcc.exe" set GCC=C:\mingw64\bin\gcc.exe
+if "%GCC%"=="" (
+    echo [ERROR] mingw gcc not found. Install Strawberry Perl or MSYS2, or pass path: build.cmd C:\path\to\gcc.exe
+    exit /b 1
+)
+echo using GCC: %GCC%
 
 if not exist bin mkdir bin
 "%GCC%" -O2 -static -Wall -o bin\win-exec-mcp.exe win-exec-mcp.c -lws2_32
