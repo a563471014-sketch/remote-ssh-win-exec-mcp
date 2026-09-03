@@ -5,7 +5,7 @@
 	"version": "0.3.1",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/a563471014-sketch/win-exec-mcp"
+		"url": "https://github.com/a563471014-sketch/remote-ssh-win-exec-mcp"
 	},
 	"license": "MIT",
 	"publisher": "a563471014-sketch",
