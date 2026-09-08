@@ -22,8 +22,11 @@ function exePath(context) {
     return path.join(context.extensionPath, 'bin', 'win-exec-mcp.exe');
 }
 
-function userMcpPath() {
-    return path.join(process.env.APPDATA || '', 'Code', 'User', 'mcp.json');
+// 当前宿主应用（VS Code / Trae 等）用户级 mcp.json：从 globalStorageUri 反推用户数据目录
+// （<userData>/User/globalStorage/<publisher>.<name> → <userData>/User/mcp.json）。
+// 不硬编码 %APPDATA%\Code——VS Code 与 Trae 同装时各写各的 mcp.json，避免互相覆盖引发"用户级 mcp 更改"提示
+function userMcpPath(context) {
+    return path.join(path.dirname(path.dirname(context.globalStorageUri.fsPath)), 'mcp.json');
 }
 
 // 本机局域网 IPv4（项目级注册用——远端发起的连接要走局域网）
@@ -73,8 +76,9 @@ function projectHttpEntry(cfg) {
 // 用户级 mcp.json：只保证 stdio 条目，并清理 http 历史残留
 // （http 条目一旦进入用户级，VS Code 的 MCP 网关会绑定其回环端口，遮蔽 exe 并与
 //   SSH 隧道/外部客户端冲突——http 只属于项目级注册与外部客户端）
+// 容器兼容：VS Code 用 servers；Trae 等 fork 用 Claude Code 风格的 mcpServers——文件里存在哪个就维护哪个
 function ensureUserMcp(context, cfg) {
-    const p = userMcpPath();
+    const p = userMcpPath(context);
     let doc;
     try {
         doc = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -82,21 +86,32 @@ function ensureUserMcp(context, cfg) {
         vscode.window.showErrorMessage('WinExec MCP: 用户级 mcp.json 解析失败（可能含注释），请手动配置：' + p);
         return;
     }
-    if (!doc.servers) doc.servers = {};
+    if (!doc.servers && !doc.mcpServers) doc.servers = {};
+    const containers = ['servers', 'mcpServers'].filter((k) => doc[k]);
     let changed = false;
     if (cfg.get('stdio.enabled', true)) {
-        const want = { type: 'stdio', command: exePath(context), args: [], location: 'local' };
-        if (JSON.stringify(doc.servers[STDIO_ID]) !== JSON.stringify(want)) {
-            doc.servers[STDIO_ID] = want;
+        for (const k of containers) {
+            const want = k === 'mcpServers'
+                ? { command: exePath(context), args: [] }
+                : { type: 'stdio', command: exePath(context), args: [], location: 'local' };
+            if (JSON.stringify(doc[k][STDIO_ID]) !== JSON.stringify(want)) {
+                doc[k][STDIO_ID] = want;
+                changed = true;
+            }
+        }
+    } else {
+        for (const k of containers) {
+            if (doc[k][STDIO_ID] && isOurEntry(STDIO_ID, doc[k][STDIO_ID])) {
+                delete doc[k][STDIO_ID];
+                changed = true;
+            }
+        }
+    }
+    for (const k of containers) {
+        if (doc[k][HTTP_ID] && isOurEntry(HTTP_ID, doc[k][HTTP_ID])) {
+            delete doc[k][HTTP_ID];
             changed = true;
         }
-    } else if (doc.servers[STDIO_ID] && isOurEntry(STDIO_ID, doc.servers[STDIO_ID])) {
-        delete doc.servers[STDIO_ID];
-        changed = true;
-    }
-    if (doc.servers[HTTP_ID] && isOurEntry(HTTP_ID, doc.servers[HTTP_ID])) {
-        delete doc.servers[HTTP_ID];
-        changed = true;
     }
     if (!changed) return;
     fs.writeFileSync(p, JSON.stringify(doc, null, '\t'));
