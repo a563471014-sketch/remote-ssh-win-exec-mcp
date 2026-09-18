@@ -1,6 +1,27 @@
-# WinExec MCP
+# WinExec MCP for Remote-SSH
 
 自包含扩展（exe + 源码 + 自动配置）：让 **Remote-SSH（Linux）端**运行的 AI agent（Copilot、Claude Code 等）在 **Windows 客户端**执行任意命令——CLI、脚本、Windows 特有命令、串口/硬件工具均可——立即返回 stdout/stderr/exit code（UTF-8）。
+
+## English Summary
+
+Self-contained extension (bundled exe + full C source code) that lets AI agents running on the **Remote-SSH (Linux) side** (Copilot, Claude Code, …) execute commands on the **Windows client** — any CLI, script, or Windows-specific tool (including serial-port/hardware utilities) — and get stdout/stderr/exit code back immediately over the existing SSH channel.
+
+**Explicit consent first.** On first activation the extension shows a consent dialog. Until you agree, it **does not** modify any file and **does not** start any process.
+
+### What this extension may modify (only after you consent, all opt-out)
+
+| Target | What | Default |
+|---|---|---|
+| `<user-data>/User/mcp.json` | Adds/removes its own `win-exec-mcp` stdio server entry (bundled exe, runs locally) | **Off** until consent |
+| Local process | Starts `win-exec-mcp.exe --http` listening on `127.0.0.1:38848` (Bearer-token protected, token auto-generated and stored locally) when a Remote-SSH window opens | **Off** until consent |
+| `~/.ssh/config` | Appends one `Host` block with `RemoteForward 127.0.0.1:28848 → 127.0.0.1:38848` (backs up the file as `config.bak-winexec` first; never touches existing entries) | **Off** (`winExecMcp.ssh.autoForward`, default `false`) |
+| Project `.vscode/mcp.json` + `.mcp.json` | Adds its HTTP server entry for agent clients | **Off** (`winExecMcp.project.autoRegister`, default `false`) |
+
+### Security model
+
+- The HTTP service binds to `127.0.0.1` by default and requires a Bearer token (auto-generated random token, persisted only in VS Code global storage; configurable via `winExecMcp.http.token`)
+- The bundled `win-exec-mcp.exe` is fully open source in this package (`src/win-exec-mcp.c`) — build it yourself with mingw if you prefer
+- No telemetry, no network calls other than the localhost MCP traffic
 
 ## 安装即用
 
@@ -8,7 +29,9 @@
 code --install-extension win-exec-mcp-0.3.1.vsix
 ```
 
-→ **Reload Window** → 弹"已更新"提示时**再点一次 Reload** → 无需任何手动配置。
+→ **Reload Window** → 首次激活会弹窗征得同意，点 **同意并启用** 即自动完成配置 → 无需其他手动配置。
+
+> 拒绝后不会写入任何文件、不会拉起进程；之后可用命令 `WinExec MCP: Enable / Re-run setup (consent)` 或 `Register user mcp.json` 随时启用。
 
 ## 双模式（自动注册到用户级 mcp.json）
 
