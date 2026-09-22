@@ -158,6 +158,21 @@ function ensureUserMcp(context, cfg) {
         .then((pick) => { if (pick) vscode.commands.executeCommand('workbench.action.reloadWindow'); });
 }
 
+// 当前窗口是否 SSH 远端（VS Code 1.138 起 remoteName='ssh-remote'，旧版为 'ssh-remote+host'，都兼容）
+function isSshRemote() {
+    return !!vscode.env.remoteName && vscode.env.remoteName.indexOf('ssh-remote') === 0;
+}
+
+// SSH 主机名：优先取工作区 URI authority（ssh-remote+host），remoteName 带主机时兜底；取不到返回 ''
+function sshHost() {
+    const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+    const auth = (folder && folder.uri && folder.uri.authority) || '';
+    const m = auth.match(/^ssh-remote\+(.+)$/);
+    if (m) return m[1];
+    const m2 = (vscode.env.remoteName || '').match(/^ssh-remote\+(.+)$/);
+    return m2 ? m2[1] : '';
+}
+
 // RemoteForward 现状：ok=已正确配置；conflict=同一入口端口已有指向别处的转发（不静默改）；
 // missing=没有（可安全追加）。按 Host 段判定：name 匹配当前主机或 * 才生效（无 Host 段的全局行视为生效）
 function sshForwardStatus(cfg, content) {
@@ -184,9 +199,8 @@ function sshForwardStatus(cfg, content) {
 // 远端窗口：自动在 ~/.ssh/config 追加 RemoteForward，让服务器本机工具经回环够到 Windows
 // 只追加独立 Host 块（不改现有内容），先备份；下次 SSH 连接生效
 function ensureSshForward(context) {
-    if (!vscode.env.remoteName) return;
-    if (vscode.env.remoteName.indexOf('ssh-remote+') !== 0) return;
-    const host = vscode.env.remoteName.slice('ssh-remote+'.length);
+    if (!isSshRemote()) return;
+    const host = sshHost();
     if (!host) return;
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     if (!cfg.get('http.enabled', false)) return;
@@ -355,22 +369,52 @@ function isPortListening(port) {
     });
 }
 
+// 轮询等待本机 HTTP 服务就绪（默认最多 10 秒）——项目注册前必须确认服务在监听，
+// 否则会写出连不上的 http 条目，让 VS Code 卡在 initialize
+async function waitHttpReady(cfg, timeoutMs) {
+    const port = cfg.get('http.port', 38848);
+    const deadline = Date.now() + (timeoutMs || 10000);
+    for (;;) {
+        if (await isPortListening(port)) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise((r) => setTimeout(r, 1000));
+    }
+}
+
+let httpSpawnFails = 0;   // 连续启动失败次数（退避用，避免 watchdog 反复堆进程）
+let httpNextTryAt = 0;    // 退避期内不允许再次启动的时间戳
+
 function startHttp(context) {
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     const port = cfg.get('http.port', 38848);
     return isPortListening(port).then((listening) => {
-        if (listening) return;
+        if (listening) { httpSpawnFails = 0; httpNextTryAt = 0; return; }
+        // 已有实例还活着（可能只是正忙/暂不可连）：先等它，绝不再叠加新进程
+        if (child && child.exitCode === null) return;
+        if (Date.now() < httpNextTryAt) return;
         const exe = exePath(context);
         if (!fs.existsSync(exe)) {
             vscode.window.showErrorMessage('WinExec MCP: 内置 exe 缺失 ' + exe);
             return;
         }
-        child = spawn(exe, ['--http', String(port), '--token', currentToken(cfg), '--parent-pid', String(process.pid)], {
-            windowsHide: true,
-            stdio: 'ignore'
-        });
+        const args = ['--http', String(port), '--token', currentToken(cfg), '--parent-pid', String(process.pid)];
+        const bindHost = cfg.get('http.host', '');
+        if (bindHost) args.push('--bind', bindHost); // 默认 exe 只绑 127.0.0.1；显式配置局域网 IP 时才绑它
+        child = spawn(exe, args, { windowsHide: true, stdio: 'ignore' });
         child.on('error', (err) => vscode.window.showErrorMessage('WinExec MCP 启动失败: ' + err.message));
         child.on('exit', () => { child = null; });
+        // 3 秒后复查：仍不可连则退避重试（15s→30s→60s→120s），避免 watchdog 每 15s 堆一个进程
+        setTimeout(() => {
+            isPortListening(port).then((ok) => {
+                if (ok) { httpSpawnFails = 0; httpNextTryAt = 0; return; }
+                httpSpawnFails++;
+                httpNextTryAt = Date.now() + Math.min(15000 * Math.pow(2, Math.min(httpSpawnFails - 1, 3)), 120000);
+                logMsg('startHttp: port ' + port + ' not listening after spawn (fail #' + httpSpawnFails + '), backoff');
+                if (httpSpawnFails === 5) {
+                    vscode.window.showWarningMessage('WinExec MCP: HTTP 服务多次启动后仍不可连（端口 ' + port + '），已放慢重试；详见“输出 → WinExec MCP”');
+                }
+            });
+        }, 3000);
     });
 }
 
@@ -397,7 +441,11 @@ async function enableExternalSetup(context) {
     ensureSshForward(context);
     const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
     if (vscode.env.remoteName && folder) {
-        registerProject().catch(() => { });
+        // HTTP 服务就绪后才写项目条目（避免写出连不上的 http 条目）
+        waitHttpReady(cfg, 12000).then((ready) => {
+            if (!ready) { logMsg('enableExternalSetup: skip project registration (HTTP service not listening)'); return; }
+            registerProject().catch(() => { });
+        });
     }
     // 开关变化触发 onDidChangeConfiguration → autoSetup：远端窗口随即追加 RemoteForward 并注册项目文件
     if (!vscode.env.remoteName) {
@@ -473,7 +521,7 @@ async function projectFilesStatus(cfg) {
 // 外部配置已无开关：点过同意（含旧版本升级）且未“暂不”即自动维护（缺失补写、过期重写）；
 // “暂不”记录于 globalState；修不了的（冲突/解析失败）才报错
 async function externalSetupSweep(context) {
-    if (!vscode.env.remoteName || vscode.env.remoteName.indexOf('ssh-remote+') !== 0) return;
+    if (!isSshRemote()) return;
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     const optOut = context.globalState.get(EXTERNAL_OPTOUT_KEY, {}) || {};
     const consentGranted = context.globalState.get(CONSENT_KEY) === true;
@@ -509,8 +557,13 @@ async function externalSetupSweep(context) {
     if (wantProject) {
         let st = await projectFilesStatus(cfg);
         if (st === 'missing' || st === 'wrong') {
-            try { await registerProject(); } catch (e) { }
-            st = await projectFilesStatus(cfg);
+            // 服务就绪才写：避免写出连不上的 http 条目让 VS Code 卡在 initialize
+            if (await waitHttpReady(cfg, 5000)) {
+                try { await registerProject(); } catch (e) { }
+                st = await projectFilesStatus(cfg);
+            } else {
+                logMsg('sweep: HTTP service not listening; skip project registration');
+            }
         }
         const stName = { missing: '条目缺失', wrong: '条目过期' };
         if (st === 'broken') problems.push('项目 mcp 文件解析失败（可能含注释），需手动处理');
@@ -549,9 +602,15 @@ function autoSetup(context) {
     ensurePortsIgnore(cfg.get('ssh.localPort', 28848), cfg.get('http.port', 38848));
     // 远端窗口自动注册到项目级 .vscode/mcp.json（“暂不”过则不动）
     // 未打开项目（无工作区）时跳过——不报错；打开/添加项目后由 workspaceFolders 变化事件补注册
+    // 只有本机 HTTP 服务真正在监听时才写条目——避免写出连不上的 http 条目让 VS Code 卡在 initialize
     const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
     if (!optOut.project && vscode.env.remoteName && folder) {
-        setTimeout(() => registerProject().catch(() => { }), 4000);
+        setTimeout(() => {
+            waitHttpReady(cfg, 12000).then((ready) => {
+                if (!ready) { logMsg('autoSetup: skip project registration (HTTP service not listening)'); return; }
+                registerProject().catch(() => { });
+            });
+        }, 4000);
     }
 }
 

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
-    <Identity Language="en-US" Id="win-exec-mcp" Version="0.3.5" Publisher="a563471014-sketch"/>
+    <Identity Language="en-US" Id="win-exec-mcp" Version="0.3.6" Publisher="a563471014-sketch"/>
     <DisplayName>WinExec MCP for Remote-SSH</DisplayName>
     <Description xml:space="preserve">Bridges Remote-SSH (Linux) AI agents to the Windows host: run any Windows command / CLI / script from a Linux-side agent (Copilot, Claude Code, …) and get stdout/stderr/exit code back. Generic MCP (stdio + HTTP) with auto-registration and SSH RemoteForward.</Description>
     <Tags>mcp,windows,agent,remote-ssh</Tags>
