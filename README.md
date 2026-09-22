@@ -6,8 +6,9 @@ commands on the **Windows client** and get stdout/stderr/exit code back — for
 any Windows command, CLI or script.
 
 - Single C file → one self-contained exe (stdio + streamable-http dual mode)
-- VS Code extension: auto-registers MCP servers, auto-starts the HTTP service,
-  auto-configures SSH RemoteForward
+- VS Code extension: one consent dialog, two scopes — **VS Code only**, or
+  **+ server-side agents** (also appends the SSH RemoteForward and registers
+  the project files; no manual editing required)
 
 ## Why
 
@@ -26,15 +27,20 @@ returns over the MCP channel (optionally through the SSH encrypted tunnel).
 
 ## Install (three ways)
 
-**A. VS Code extension (.vsix)** — full auto config:
+**A. VS Code extension (.vsix)** — consent dialog, then full auto config:
 
 ```
 code --install-extension win-exec-mcp-<ver>.vsix
 ```
 
-→ Reload Window → if it says "updated", Reload again → done. The extension
-auto-registers both MCP servers and (in a remote window) starts the HTTP
-service + SSH forwarding.
+→ Reload Window → pick a scope in the consent dialog: **仅 VS Code** or
+**完整配置（含服务器端 agent）**. The full option also appends the SSH
+RemoteForward and writes the project `.vscode/mcp.json` / `.mcp.json`, so
+server-side Claude Code / Cursor connect without any manual editing. It can
+also be enabled later with `WinExec MCP: 配置服务器端 agent`. Once authorized
+(including consent given in older versions), remote windows auto-enable and
+repair the chain (RemoteForward + project registration incl. token), asking
+for a window reload only when files were fixed.
 
 **B. Standalone exe (stdio only, no VS Code):**
 
@@ -50,7 +56,7 @@ win-exec-mcp.exe --http <port> --token <token>   # streamable-http mode
 build.cmd        # compile -> refresh extension bundle -> pack vsix
 ```
 
-## Dual MCP modes (auto-registered by the extension)
+## Dual MCP modes (registered by the extension)
 
 | server | type | notes |
 |---|---|---|
@@ -80,8 +86,6 @@ SSH tunnel, no firewall/LAN-IP dependency.
 | `http.token` | *(auto)* | **Bearer token — leave empty**: a random token is generated on first activation and persisted. Set one explicitly if you need a fixed token. |
 | `http.host` | *(auto)* | manual LAN IP (multi-NIC / hotspot); empty = auto-detect |
 | `ssh.localPort` | 28848 | server-side loopback port (RemoteForward) |
-| `ssh.autoForward` | true | auto-append RemoteForward to `~/.ssh/config` (backs up first) |
-| `project.autoRegister` | true | register http entry in project `.vscode/mcp.json` and `.mcp.json` |
 
 ## Security notes
 
@@ -96,7 +100,8 @@ SSH tunnel, no firewall/LAN-IP dependency.
 ## Commands
 
 - `WinExec MCP: Register user mcp.json`
-- `WinExec MCP: 注册到本项目 / 从本项目移除注册` (project-level http, LAN IP URL)
+- `WinExec MCP: 配置服务器端 agent（SSH 转发 + 项目注册）` (one-click = the “+ server-side agents” consent choice)
+- `WinExec MCP: 注册到本项目 / 从本项目移除注册` (project-level http; SSH-tunnel URL by default, LAN IP when `http.host` is set)
 - `WinExec MCP: Start / Stop HTTP service`
 
 ## Source layout
