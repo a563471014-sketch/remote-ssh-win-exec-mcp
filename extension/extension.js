@@ -14,10 +14,33 @@ const crypto = require('crypto');
 const STDIO_ID = 'win-exec-mcp';
 const HTTP_ID = 'win-http';
 const CONSENT_KEY = 'consentGranted';
+const EXTERNAL_OPTOUT_KEY = 'externalOptOut'; // 用户“暂不”过的外部配置项（不再自动维护）：{ ssh?: true, project?: true }
 
 let child = null;
 let autoToken = null;
 let watchdog = null; // 定时检查：服务被其他窗口关闭/崩溃时自动恢复
+let outChannel = null;
+
+// 输出面板日志（“输出 → WinExec MCP”），便于排查“到底跑没跑/修没修”
+function logMsg(...parts) {
+    if (!outChannel) outChannel = vscode.window.createOutputChannel('WinExec MCP');
+    outChannel.appendLine('[' + new Date().toISOString().slice(11, 19) + '] ' + parts.join(' '));
+}
+
+// 修复了需要重载才生效的配置文件后，合并成一条提示（2 秒窗口内多次修复合并）
+let repairTimer = null;
+const repairedItems = new Set();
+function noteRepaired(what) {
+    repairedItems.add(what);
+    logMsg('repaired:', what);
+    if (repairTimer) clearTimeout(repairTimer);
+    repairTimer = setTimeout(() => {
+        const list = Array.from(repairedItems).join('、');
+        repairedItems.clear();
+        vscode.window.showInformationMessage('WinExec MCP: 已修复配置文件（' + list + '），需重载窗口生效', '重载窗口')
+            .then((pick) => { if (pick === '重载窗口') vscode.commands.executeCommand('workbench.action.reloadWindow'); });
+    }, 2000);
+}
 
 function exePath(context) {
     return path.join(context.extensionPath, 'bin', 'win-exec-mcp.exe');
@@ -135,15 +158,40 @@ function ensureUserMcp(context, cfg) {
         .then((pick) => { if (pick) vscode.commands.executeCommand('workbench.action.reloadWindow'); });
 }
 
+// RemoteForward 现状：ok=已正确配置；conflict=同一入口端口已有指向别处的转发（不静默改）；
+// missing=没有（可安全追加）。按 Host 段判定：name 匹配当前主机或 * 才生效（无 Host 段的全局行视为生效）
+function sshForwardStatus(cfg, content) {
+    const localPort = cfg.get('ssh.localPort', 28848);
+    const port = cfg.get('http.port', 38848);
+    const host = vscode.env.remoteName.slice('ssh-remote+'.length);
+    if (content === undefined) {
+        try { content = fs.readFileSync(path.join(os.homedir(), '.ssh', 'config'), 'utf8'); } catch (e) { return 'missing'; }
+    }
+    const exact = new RegExp('^\\s*RemoteForward\\s+(?:127\\.0\\.0\\.1:)?' + localPort + '\\s+(?:127\\.0\\.0\\.1|localhost):' + port + '\\s*(?:#.*)?$');
+    const anyLocal = new RegExp('^\\s*RemoteForward\\b[^\\r\\n#]*(?<![0-9])' + localPort + '(?![0-9])');
+    const applies = (ctx) => !ctx || ctx.split(/\s+/).some((n) => n === '*' || n.toLowerCase() === host.toLowerCase());
+    let hostCtx = null, ok = false, conflict = false;
+    for (const line of content.split(/\r?\n/)) {
+        const hm = line.match(/^\s*Host\s+(.+?)\s*$/i);
+        if (hm) { hostCtx = hm[1]; continue; }
+        if (!applies(hostCtx)) continue;
+        if (exact.test(line)) ok = true;
+        else if (anyLocal.test(line)) conflict = true;
+    }
+    return ok ? 'ok' : (conflict ? 'conflict' : 'missing');
+}
+
 // 远端窗口：自动在 ~/.ssh/config 追加 RemoteForward，让服务器本机工具经回环够到 Windows
 // 只追加独立 Host 块（不改现有内容），先备份；下次 SSH 连接生效
-function ensureSshForward() {
+function ensureSshForward(context) {
     if (!vscode.env.remoteName) return;
     if (vscode.env.remoteName.indexOf('ssh-remote+') !== 0) return;
     const host = vscode.env.remoteName.slice('ssh-remote+'.length);
     if (!host) return;
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
-    if (!cfg.get('http.enabled', false) || !cfg.get('ssh.autoForward', false)) return;
+    if (!cfg.get('http.enabled', false)) return;
+    // 已授权即维护；用户“暂不”过（internal opt-out）则不再动
+    if (context && (context.globalState.get(EXTERNAL_OPTOUT_KEY, {}) || {}).ssh) return;
     const port = cfg.get('http.port', 38848);
     const localPort = cfg.get('ssh.localPort', 28848);
     const sshDir = path.join(os.homedir(), '.ssh');
@@ -151,15 +199,15 @@ function ensureSshForward() {
     try {
         let content = '';
         try { content = fs.readFileSync(sshConfig, 'utf8'); } catch (e) { content = ''; }
-        const re = new RegExp('RemoteForward[^\\r\\n]*:' + localPort + '\\b');
-        if (re.test(content)) return; // 已配置过
+        const status = sshForwardStatus(cfg, content);
+        if (status !== 'missing') return; // ok=已配置；conflict=同入口端口已有其它转发，不静默改（体检会提示）
         const block = '\nHost ' + host + '\n  RemoteForward 127.0.0.1:' + localPort + ' 127.0.0.1:' + port + '\n';
         if (!fs.existsSync(sshDir)) fs.mkdirSync(sshDir, { recursive: true });
         if (fs.existsSync(sshConfig)) {
             try { fs.copyFileSync(sshConfig, sshConfig + '.bak-winexec'); } catch (e) { }
         }
         fs.appendFileSync(sshConfig, block);
-        vscode.window.showInformationMessage('WinExec MCP: 已在 ~/.ssh/config 追加 RemoteForward 127.0.0.1:' + localPort + ' → 127.0.0.1:' + port + '（下次 SSH 连接生效）');
+        noteRepaired('SSH RemoteForward 127.0.0.1:' + localPort + ' → 127.0.0.1:' + port);
     } catch (e) {
         // ssh config 读写受限时静默跳过（可手动配置）
     }
@@ -262,7 +310,7 @@ async function registerProject() {
     }
 
     if (changed) {
-        vscode.window.showInformationMessage('WinExec MCP: 已注册到本项目（.vscode/mcp.json + .mcp.json）');
+        noteRepaired('项目注册（.vscode/mcp.json + .mcp.json）');
         setTimeout(autoStartHttpConnection, 3000);
     }
 }
@@ -336,28 +384,150 @@ function consented(context, cfg) {
     return !!cfg.get('stdio.enabled', false) || !!cfg.get('http.enabled', false);
 }
 
-// 首次运行征得同意：说明将要修改的内容，用户明确同意后才启用任何自动行为
+// 服务器端 agent（Claude Code / Cursor 等）完整链路：HTTP 服务 + SSH 回环转发 + 项目注册。
+// 显式触发（授权弹窗“启用”/命令）即视为对 ~/.ssh/config 与项目文件写入的明确同意
+async function enableExternalSetup(context) {
+    if (context) await context.globalState.update(EXTERNAL_OPTOUT_KEY, {}); // 授权“启用”/完整配置/命令 = 重新启用全部，清掉历史的“暂不”记录
+    logMsg('enableExternalSetup: clear opt-out');
+    let cfg = vscode.workspace.getConfiguration('winExecMcp');
+    if (!cfg.get('http.enabled', false)) {
+        await cfg.update('http.enabled', true, vscode.ConfigurationTarget.Global);
+    }
+    // 直接执行一轮修复（外部配置已无开关：未 opt-out 即维护）
+    ensureSshForward(context);
+    const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+    if (vscode.env.remoteName && folder) {
+        registerProject().catch(() => { });
+    }
+    // 开关变化触发 onDidChangeConfiguration → autoSetup：远端窗口随即追加 RemoteForward 并注册项目文件
+    if (!vscode.env.remoteName) {
+        vscode.window.showInformationMessage('WinExec MCP: 已开启服务器端 agent 配置（HTTP 服务 + SSH 回环转发 + 项目注册），Remote-SSH 窗口打开时自动生效');
+    }
+}
+
+// 首次运行征得同意：明确列出将修改的文件；“完整配置”额外覆盖服务器端 agent 链路
+const CONSENT_FULL = '完整配置（含服务器端 agent）';
+const CONSENT_BASIC = '仅 VS Code';
+
 async function askConsent(context) {
     const pick = await vscode.window.showWarningMessage(
-        'WinExec MCP 需要你的同意才会修改配置：\n' +
-        '1) 将内置 win-exec-mcp.exe 注册到用户级 mcp.json（stdio MCP 服务器）\n' +
-        '2) Remote-SSH 窗口打开时在本机 127.0.0.1 启动 HTTP MCP 服务并自动连接\n' +
-        '默认不修改 ~/.ssh/config 与项目文件（相关设置默认关闭，可后续手动开启）',
-        { modal: true }, '同意并启用', '暂不');
-    if (pick === '同意并启用') {
-        await context.globalState.update(CONSENT_KEY, true);
-        const cfg = vscode.workspace.getConfiguration('winExecMcp');
-        await cfg.update('stdio.enabled', true, vscode.ConfigurationTarget.Global);
-        await cfg.update('http.enabled', true, vscode.ConfigurationTarget.Global);
-        return true;
+        'WinExec MCP 需要你的同意才会修改配置，请选择范围：\n' +
+        '· ' + CONSENT_FULL + '：注册用户级 mcp.json（stdio）；Remote-SSH 窗口自动启动本机 HTTP 服务并连接；追加 ~/.ssh/config（独立 Host 块，原文件先备份）；向当前项目写入 .vscode/mcp.json 和 .mcp.json（含 Bearer token）——服务器端 Claude Code / Cursor 等经 SSH 回环直连\n' +
+        '· ' + CONSENT_BASIC + '：只做前两项，VS Code 内建 agent 即可使用；外部 agent 之后可随时用命令 “WinExec MCP: 配置服务器端 agent” 一键补齐',
+        { modal: true }, CONSENT_FULL, CONSENT_BASIC, '暂不');
+    if (pick !== CONSENT_FULL && pick !== CONSENT_BASIC) {
+        await context.globalState.update(CONSENT_KEY, false);
+        return false;
     }
-    await context.globalState.update(CONSENT_KEY, false);
-    return false;
+    await context.globalState.update(CONSENT_KEY, true);
+    const cfg = vscode.workspace.getConfiguration('winExecMcp');
+    await cfg.update('stdio.enabled', true, vscode.ConfigurationTarget.Global);
+    await cfg.update('http.enabled', true, vscode.ConfigurationTarget.Global);
+    if (pick === CONSENT_FULL) {
+        await enableExternalSetup(context); // 完整配置：外部 agent 链路全开
+    } else {
+        // 仅 VS Code：明确不要外部配置（不再自动启用；命令可随时补齐）
+        await context.globalState.update(EXTERNAL_OPTOUT_KEY, { ssh: true, project: true });
+    }
+    logMsg('consent choice:', pick);
+    return true;
+}
+
+// —— 外部 agent 配置巡检（远端窗口每次激活执行）——
+// 唯一提示 = 授权提示（启用 / 暂不）；已授权后缺失/过期直接修复（ensureSshForward /
+// registerProject + noteRepaired），修不了的（端口冲突 / 文件解析失败）才报错
+
+// 项目两级 mcp 文件现状：缺条目/条目过期=可自动重写；解析失败=需手动处理
+async function projectFilesStatus(cfg) {
+    const paths = workspaceMcpPaths();
+    if (!paths) return 'na';
+    const entry = projectHttpEntry(cfg);
+    const mEntry = { type: 'http', url: entry.url, headers: entry.headers };
+    const rank = { ok: 0, missing: 1, wrong: 2, broken: 3 };
+    let worst = 'ok';
+    const bump = (s) => { if (rank[s] > rank[worst]) worst = s; };
+    const readJson = async (uri) => {
+        const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri)).trim();
+        return text ? JSON.parse(text) : {};
+    };
+    try {
+        const doc = await readJson(paths.file);
+        const cur = doc.servers && doc.servers[HTTP_ID];
+        if (!cur) bump('missing');
+        else if (!sameHttpEntry(cur, entry)) bump('wrong');
+    } catch (e) {
+        bump(e && e.code === 'FileNotFound' ? 'missing' : 'broken');
+    }
+    try {
+        const mdoc = await readJson(vscode.Uri.joinPath(paths.dir, '..', '.mcp.json'));
+        const cur = mdoc.mcpServers && mdoc.mcpServers['win-exec-mcp'];
+        if (!cur) bump('missing');
+        else if (!sameHttpEntry(cur, mEntry)) bump('wrong');
+    } catch (e) {
+        bump(e && e.code === 'FileNotFound' ? 'missing' : 'broken');
+    }
+    return worst;
+}
+
+// —— 外部 agent 配置巡检（远端窗口每次激活）——
+// 外部配置已无开关：点过同意（含旧版本升级）且未“暂不”即自动维护（缺失补写、过期重写）；
+// “暂不”记录于 globalState；修不了的（冲突/解析失败）才报错
+async function externalSetupSweep(context) {
+    if (!vscode.env.remoteName || vscode.env.remoteName.indexOf('ssh-remote+') !== 0) return;
+    const cfg = vscode.workspace.getConfiguration('winExecMcp');
+    const optOut = context.globalState.get(EXTERNAL_OPTOUT_KEY, {}) || {};
+    const consentGranted = context.globalState.get(CONSENT_KEY) === true;
+    const wantSsh = !optOut.ssh;
+    const wantProject = !optOut.project;
+    logMsg('sweep: consent=' + consentGranted + ' ssh=' + wantSsh + ' project=' + wantProject);
+    // 没走过同意弹窗（仅手动开了部分开关）：提示一次授权
+    if (!consentGranted) {
+        if (!wantSsh && !wantProject) return;
+        const hasFolder = !!(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length);
+        const pick = await vscode.window.showWarningMessage(
+            'WinExec MCP: 服务器端 agent（Claude Code / Cursor 等）配置未启用（SSH 回环转发 / 项目注册），需要授权' +
+            (hasFolder ? '' : '。当前未打开项目，项目注册会在打开后自动完成') +
+            '。授权后每次启动自动检查并修复，修复后提示重载生效',
+            '启用', '暂不');
+        if (pick === '启用') {
+            await enableExternalSetup(context);
+        } else if (pick === '暂不') {
+            await context.globalState.update(EXTERNAL_OPTOUT_KEY, { ssh: true, project: true });
+        }
+        return;
+    }
+    // 已授权：检查 + 兜底修复；只报告修不了的（冲突 / 解析失败 / 写入失败）
+    const problems = [];
+    if (wantSsh && cfg.get('http.enabled', false)) {
+        if (sshForwardStatus(cfg) !== 'ok') {
+            ensureSshForward(context); // 缺失则补写；conflict 时不碰（下面报告）
+            const s = sshForwardStatus(cfg);
+            if (s === 'conflict') problems.push('~/.ssh/config 同一入口端口已有其它 RemoteForward，需手动调整');
+            else if (s !== 'ok') problems.push('无法写入 ~/.ssh/config（检查文件权限）');
+        }
+    }
+    if (wantProject) {
+        let st = await projectFilesStatus(cfg);
+        if (st === 'missing' || st === 'wrong') {
+            try { await registerProject(); } catch (e) { }
+            st = await projectFilesStatus(cfg);
+        }
+        const stName = { missing: '条目缺失', wrong: '条目过期' };
+        if (st === 'broken') problems.push('项目 mcp 文件解析失败（可能含注释），需手动处理');
+        else if (st !== 'ok' && st !== 'na') problems.push('无法写入项目 mcp 文件（' + (stName[st] || st) + '）');
+    }
+    if (problems.length) {
+        logMsg('sweep problems: ' + problems.join('；'));
+        vscode.window.showWarningMessage('WinExec MCP: ' + problems.join('；'));
+    } else {
+        logMsg('sweep: ok');
+    }
 }
 
 // 同意后的自动配置（幂等，配置变化时可重复执行）
 function autoSetup(context) {
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
+    const optOut = context.globalState.get(EXTERNAL_OPTOUT_KEY, {}) || {};
     ensureUserMcp(context, cfg);
     if (vscode.env.remoteName && cfg.get('http.enabled', false)) {
         setTimeout(() => startHttp(context), 3000);
@@ -373,18 +543,38 @@ function autoSetup(context) {
         }, 15000);
     }
     autoStartHttpConnection();
-    ensureSshForward();
+    if (!optOut.ssh) ensureSshForward(context);
     // 远端被 autoForward 误转发的端口是 RemoteForward 的入口端（ssh.localPort），不是 exe 的 http.port；
     // http.port 一并忽略是兜底：localPort 若配成与 exe 相同端口，转发监听会遮蔽 exe
     ensurePortsIgnore(cfg.get('ssh.localPort', 28848), cfg.get('http.port', 38848));
-    // 可选：远端窗口激活时自动注册到项目级 .vscode/mcp.json（默认关闭，避免擅改项目文件）
-    if (cfg.get('project.autoRegister', false) && vscode.env.remoteName) {
+    // 远端窗口自动注册到项目级 .vscode/mcp.json（“暂不”过则不动）
+    // 未打开项目（无工作区）时跳过——不报错；打开/添加项目后由 workspaceFolders 变化事件补注册
+    const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+    if (!optOut.project && vscode.env.remoteName && folder) {
         setTimeout(() => registerProject().catch(() => { }), 4000);
     }
 }
 
 function activate(context) {
+    outChannel = vscode.window.createOutputChannel('WinExec MCP');
+    context.subscriptions.push(outChannel);
+    logMsg('activate v' + context.extension.packageJSON.version + (vscode.env.remoteName ? ' remote=' + vscode.env.remoteName : ' local'));
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
+    // 迁移：0.3.5 起移除 ssh.autoForward / project.autoRegister 两个设置，
+    // 曾显式设为 false 的转为内部“不启用”记录（避免把用户主动关过的功能又静默打开）
+    try {
+        const optOut = Object.assign({}, context.globalState.get(EXTERNAL_OPTOUT_KEY, {}) || {});
+        let migrated = false;
+        for (const [key, setting] of [['ssh', 'ssh.autoForward'], ['project', 'project.autoRegister']]) {
+            const v = cfg.get(setting);
+            if (v === false && !optOut[key]) { optOut[key] = true; migrated = true; }
+            else if (v === true && optOut[key]) { delete optOut[key]; migrated = true; }
+        }
+        if (migrated) {
+            context.globalState.update(EXTERNAL_OPTOUT_KEY, optOut);
+            logMsg('migrated legacy switches → optOut=' + JSON.stringify(optOut));
+        }
+    } catch (e) { }
     // token 留空时自动生成并持久化（默认 test123；显式留空才触发自动生成）
     if (!cfg.get('http.token', '')) {
         autoToken = context.globalState.get('httpToken') || crypto.randomBytes(8).toString('hex');
@@ -402,6 +592,8 @@ function activate(context) {
         }),
         vscode.commands.registerCommand('winExecMcp.registerProject', registerProject),
         vscode.commands.registerCommand('winExecMcp.unregisterProject', unregisterProject),
+        // 一键配置服务器端 agent 链路：等价于首次弹窗选“完整配置”
+        vscode.commands.registerCommand('winExecMcp.setupExternal', () => enableExternalSetup(context)),
         vscode.commands.registerCommand('winExecMcp.setup', async () => {
             if (await askConsent(context)) autoSetup(context);
         })
@@ -409,6 +601,8 @@ function activate(context) {
     // 未同意前不写任何文件、不拉起任何进程：首次运行弹窗征询；同意过或手动开启开关才自动配置
     if (consented(context, cfg)) {
         autoSetup(context);
+        // 巡检：远端窗口每次激活都检查——未授权→授权提示；已授权→修复缺失/过期，修好提示重载
+        setTimeout(() => externalSetupSweep(context).catch(() => { }), 12000);
     } else if (context.globalState.get(CONSENT_KEY) === undefined) {
         askConsent(context).then((ok) => { if (ok) autoSetup(context); });
     }
@@ -420,6 +614,8 @@ function activate(context) {
             if (!c2.get('http.enabled', false)) stopHttp();
         }
     }));
+    // 打开/添加项目后补做项目注册（没打开项目时 autoSetup 自动跳过，不报错）
+    context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => autoSetup(context)));
 }
 
 function deactivate() {
