@@ -19,6 +19,42 @@ let child = null;
 let autoToken = null;
 let watchdog = null; // 定时检查：服务被其他窗口关闭/崩溃时自动恢复
 
+// —— 更新提示：装/更新扩展后，当前窗口仍在跑旧代码，提示重载窗口 ——
+let updateWatcher = null;      // fs.watch 句柄
+let updateWatchTimer = null;   // 60s 轮询兜底
+let updatePromptedFor = null;  // 已提示过的目标版本（防重复弹）
+
+// 比对磁盘上扩展注册表记录的版本 vs 当前运行版本；不一致就提示重载
+function checkPendingUpdate(context) {
+    try {
+        const extDir = path.dirname(context.extensionPath);
+        const list = JSON.parse(fs.readFileSync(path.join(extDir, 'extensions.json'), 'utf8'));
+        const running = context.extension.packageJSON.version;
+        const me = list.find((e) => e.identifier && e.identifier.id === context.extension.id);
+        if (!me || !me.version || me.version === running || updatePromptedFor === me.version) return;
+        updatePromptedFor = me.version;
+        vscode.window.showInformationMessage(
+            'WinExec MCP: 已安装版本 ' + me.version + '（当前窗口运行 ' + running + '），重载窗口后生效',
+            '重载窗口'
+        ).then((pick) => { if (pick === '重载窗口') vscode.commands.executeCommand('workbench.action.reloadWindow'); });
+    } catch (e) { }
+}
+
+// 监听扩展目录变化（安装/更新会重写 extensions.json），另加 60s 轮询兜底
+function watchExtensionUpdates(context) {
+    try {
+        const extDir = path.dirname(context.extensionPath);
+        let debounce = null;
+        updateWatcher = fs.watch(extDir, { persistent: false }, (ev, name) => {
+            if (name && name !== 'extensions.json' && name !== '.obsolete') return;
+            if (debounce) clearTimeout(debounce);
+            debounce = setTimeout(() => checkPendingUpdate(context), 1000);
+        });
+        updateWatchTimer = setInterval(() => checkPendingUpdate(context), 60000);
+        setTimeout(() => checkPendingUpdate(context), 5000); // 启动后也查一次
+    } catch (e) { }
+}
+
 function exePath(context) {
     return path.join(context.extensionPath, 'bin', 'win-exec-mcp.exe');
 }
@@ -420,10 +456,14 @@ function activate(context) {
             if (!c2.get('http.enabled', false)) stopHttp();
         }
     }));
+    // 安装/更新后提示重载（当前窗口仍在跑旧代码）
+    watchExtensionUpdates(context);
 }
 
 function deactivate() {
     if (watchdog) { clearInterval(watchdog); watchdog = null; }
+    if (updateWatchTimer) { clearInterval(updateWatchTimer); updateWatchTimer = null; }
+    if (updateWatcher) { try { updateWatcher.close(); } catch (e) { } updateWatcher = null; }
     stopHttp();
 }
 
