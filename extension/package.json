@@ -2,7 +2,7 @@
 	"name": "win-exec-mcp",
 	"displayName": "WinExec MCP for Remote-SSH",
 	"description": "MCP server bridging Remote-SSH (Linux) AI agents to the Windows host: run Windows commands/CLIs/scripts from Copilot, Claude Code, etc. and get stdout/stderr/exit code back. stdio + HTTP modes, explicit first-run consent, no silent config changes.",
-	"version": "0.3.7",
+	"version": "0.3.3",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/a563471014-sketch/remote-ssh-win-exec-mcp"
@@ -46,10 +46,6 @@
 				"title": "WinExec MCP: 从本项目移除注册"
 			},
 			{
-				"command": "winExecMcp.setupExternal",
-				"title": "WinExec MCP: 配置服务器端 agent（SSH 转发 + 项目注册）"
-			},
-			{
 				"command": "winExecMcp.setup",
 				"title": "WinExec MCP: Enable / Re-run setup (consent)"
 			}
@@ -86,6 +82,16 @@
 					"type": "number",
 					"default": 28848,
 					"description": "服务器本机回环端口（RemoteForward 127.0.0.1:<localPort> → Windows 127.0.0.1:<http.port>）"
+				},
+				"winExecMcp.ssh.autoForward": {
+					"type": "boolean",
+					"default": true,
+					"description": "远端窗口激活时自动在 ~/.ssh/config 追加 RemoteForward（只追加独立 Host 块，原配置先备份）。默认关闭——显式开启即视为同意修改 ~/.ssh/config"
+				},
+				"winExecMcp.project.autoRegister": {
+					"type": "boolean",
+					"default": true,
+					"description": "远端窗口激活时自动注册 http 条目到项目级 .vscode/mcp.json 和项目根 .mcp.json。默认关闭——避免未经同意修改项目文件；也可用命令手动注册"
 				}
 			}
 		}

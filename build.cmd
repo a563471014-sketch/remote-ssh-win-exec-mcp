@@ -3,7 +3,7 @@ rem WinExec MCP pack: compile C -> refresh bundled files -> build vsix
 rem NOTE: bump VER together with extension\package.json version
 setlocal
 cd /d "%~dp0"
-set VER=0.3.7
+set VER=0.3.3
 
 rem ---- locate mingw gcc (first arg overrides; else PATH; else common installs) ----
 set GCC=%1
