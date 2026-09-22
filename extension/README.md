@@ -26,7 +26,7 @@ Self-contained extension (bundled exe + full C source code) that lets AI agents 
 ## 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.3.3.vsix
+code --install-extension win-exec-mcp-0.3.6.vsix
 ```
 
 → **Reload Window** → 首次激活会弹窗征得同意，点 **同意并启用** 即自动完成配置 → 无需其他手动配置。
