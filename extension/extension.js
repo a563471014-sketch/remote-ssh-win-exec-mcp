@@ -369,18 +369,6 @@ function isPortListening(port) {
     });
 }
 
-// 轮询等待本机 HTTP 服务就绪（默认最多 10 秒）——项目注册前必须确认服务在监听，
-// 否则会写出连不上的 http 条目，让 VS Code 卡在 initialize
-async function waitHttpReady(cfg, timeoutMs) {
-    const port = cfg.get('http.port', 38848);
-    const deadline = Date.now() + (timeoutMs || 10000);
-    for (;;) {
-        if (await isPortListening(port)) return true;
-        if (Date.now() >= deadline) return false;
-        await new Promise((r) => setTimeout(r, 1000));
-    }
-}
-
 let httpSpawnFails = 0;   // 连续启动失败次数（退避用，避免 watchdog 反复堆进程）
 let httpNextTryAt = 0;    // 退避期内不允许再次启动的时间戳
 
@@ -441,11 +429,7 @@ async function enableExternalSetup(context) {
     ensureSshForward(context);
     const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
     if (vscode.env.remoteName && folder) {
-        // HTTP 服务就绪后才写项目条目（避免写出连不上的 http 条目）
-        waitHttpReady(cfg, 12000).then((ready) => {
-            if (!ready) { logMsg('enableExternalSetup: skip project registration (HTTP service not listening)'); return; }
-            registerProject().catch(() => { });
-        });
+        registerProject().catch(() => { });
     }
     // 开关变化触发 onDidChangeConfiguration → autoSetup：远端窗口随即追加 RemoteForward 并注册项目文件
     if (!vscode.env.remoteName) {
@@ -557,13 +541,8 @@ async function externalSetupSweep(context) {
     if (wantProject) {
         let st = await projectFilesStatus(cfg);
         if (st === 'missing' || st === 'wrong') {
-            // 服务就绪才写：避免写出连不上的 http 条目让 VS Code 卡在 initialize
-            if (await waitHttpReady(cfg, 5000)) {
-                try { await registerProject(); } catch (e) { }
-                st = await projectFilesStatus(cfg);
-            } else {
-                logMsg('sweep: HTTP service not listening; skip project registration');
-            }
+            try { await registerProject(); } catch (e) { }
+            st = await projectFilesStatus(cfg);
         }
         const stName = { missing: '条目缺失', wrong: '条目过期' };
         if (st === 'broken') problems.push('项目 mcp 文件解析失败（可能含注释），需手动处理');
@@ -602,15 +581,10 @@ function autoSetup(context) {
     ensurePortsIgnore(cfg.get('ssh.localPort', 28848), cfg.get('http.port', 38848));
     // 远端窗口自动注册到项目级 .vscode/mcp.json（“暂不”过则不动）
     // 未打开项目（无工作区）时跳过——不报错；打开/添加项目后由 workspaceFolders 变化事件补注册
-    // 只有本机 HTTP 服务真正在监听时才写条目——避免写出连不上的 http 条目让 VS Code 卡在 initialize
+    // 无条件写条目（声明式配置：服务暂时不可用时 VS Code 会自行重试，服务恢复即可用）
     const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
     if (!optOut.project && vscode.env.remoteName && folder) {
-        setTimeout(() => {
-            waitHttpReady(cfg, 12000).then((ready) => {
-                if (!ready) { logMsg('autoSetup: skip project registration (HTTP service not listening)'); return; }
-                registerProject().catch(() => { });
-            });
-        }, 4000);
+        setTimeout(() => registerProject().catch(() => { }), 4000);
     }
 }
 
