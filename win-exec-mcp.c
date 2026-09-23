@@ -288,6 +288,36 @@ static char *gbk_to_utf8(const char *gbk, int len) {
     return u;
 }
 
+/* ============ git-bash 探测（仅显式候选路径；绝不回退 System32\bash.exe=WSL） ============ */
+static char g_bash_path[MAX_PATH * 2]; /* 空 = 未找到 */
+
+static int file_exists_a(const char *p) {
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static void detect_git_bash(void) {
+    g_bash_path[0] = 0;
+    char cand[MAX_PATH * 2];
+    const char *envs[3];
+    int n = 0;
+    if (getenv("ProgramFiles")) envs[n++] = "ProgramFiles";
+    if (getenv("ProgramFiles(x86)")) envs[n++] = "ProgramFiles(x86)";
+    if (getenv("LocalAppData")) envs[n++] = "LocalAppData";
+    for (int i = 0; i < n; i++) {
+        const char *dir = getenv(envs[i]);
+        if (strcmp(envs[i], "LocalAppData") == 0)
+            snprintf(cand, sizeof(cand), "%s\\Programs\\Git\\bin\\bash.exe", dir);
+        else
+            snprintf(cand, sizeof(cand), "%s\\Git\\bin\\bash.exe", dir);
+        if (file_exists_a(cand)) {
+            strncpy(g_bash_path, cand, sizeof(g_bash_path) - 1);
+            g_bash_path[sizeof(g_bash_path) - 1] = 0;
+            return;
+        }
+    }
+}
+
 /* ============ 进度通知（notifications/progress）——自动流式输出 ============ */
 /* 当客户端在 tools/call 的 params._meta.progressToken 里带令牌时：
    - stdio：命令执行期间把新输出按行作为 progress 通知实时写到 stdout；
@@ -419,7 +449,7 @@ static void out_append(char **out, int *olen, int *ocap, const char *buf, int rd
     (*out)[*olen] = 0;
 }
 
-static RunResult run_cmd(const char *cmd, int timeout_ms) {
+static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
     RunResult rr = { NULL, -1, 0, 0 };
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE hOutR = NULL, hOutW = NULL;
@@ -433,9 +463,9 @@ static RunResult run_cmd(const char *cmd, int timeout_ms) {
     si.hStdError = hOutW;
     PROCESS_INFORMATION pi = { 0 };
 
-    /* cmd /c <command>，合并 stderr 到 stdout */
-    char *cmdline = (char *)malloc(strlen(cmd) + 8);
-    sprintf(cmdline, "cmd /c %s", cmd);
+    /* 合并 stderr 到 stdout；完整命令行由调用方构造（cmd /c 或 git-bash 两条路径）。
+       CreateProcess 可能修改命令行缓冲，这里持有可变副本。 */
+    char *cmdline = _strdup(cmd_line_in);
     /* UNC cwd 自我修复：win-exec 当前目录若是 UNC（\\\\ 开头），cmd 继承会报
        "UNC 路径不受支持"；此时用系统盘符作子进程 cwd（不依赖任何盘映射）。 */
     char safe_cwd[MAX_PATH] = "";
@@ -522,6 +552,65 @@ static RunResult run_cmd(const char *cmd, int timeout_ms) {
     return rr;
 }
 
+/* ============ 两条执行路径的入口 ============ */
+static void sbuf_append(char **buf, int *len, int *cap, const char *s) {
+    int n = (int)strlen(s);
+    if (*len + n + 1 > *cap) { *cap = (*len + n + 16) * 2; *buf = (char *)realloc(*buf, *cap); }
+    memcpy(*buf + *len, s, n);
+    *len += n;
+    (*buf)[*len] = 0;
+}
+
+/* 按 Windows/MSYS 参数规则加引号：\ 仅在 " 前成对双写，" 用 \" 转义 */
+static void sbuf_append_quoted(char **buf, int *len, int *cap, const char *s) {
+    int n = (int)strlen(s);
+    if (*len + n * 2 + 4 > *cap) { *cap = (*len + n * 2 + 16) * 2; *buf = (char *)realloc(*buf, *cap); }
+    char *b = *buf;
+    b[(*len)++] = '"';
+    int bs = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\') { bs++; b[(*len)++] = '\\'; continue; }
+        if (*p == '"') {
+            for (int k = 0; k < bs; k++) b[(*len)++] = '\\'; /* 双写：2n+1 个 \ 后跟字面 " */
+            b[(*len)++] = '\\';
+            b[(*len)++] = '"';
+            bs = 0;
+            continue;
+        }
+        bs = 0;
+        b[(*len)++] = *p;
+    }
+    for (int k = 0; k < bs; k++) b[(*len)++] = '\\'; /* 结尾反斜杠双写，防转义收尾引号 */
+    b[(*len)++] = '"';
+    b[*len] = 0;
+}
+
+/* 默认路径：cmd /c <command>。注意 cmd 的 /c 引号启发式：命令以引号开头且含特殊字符时
+   会剥掉首尾引号（"C:\Program Files\..." 被截断成 'C:\Program'），此处主动再包一层。 */
+static RunResult run_cmd(const char *cmd, int timeout_ms) {
+    int s0 = 0;
+    while (cmd[s0] == ' ' || cmd[s0] == '\t') s0++;
+    char *line = (char *)malloc(strlen(cmd) + 16);
+    if (cmd[s0] == '"') sprintf(line, "cmd /c \"%s\"", cmd);
+    else sprintf(line, "cmd /c %s", cmd);
+    RunResult rr = run_cmdline(line, timeout_ms);
+    free(line);
+    return rr;
+}
+
+/* git-bash 路径：直接 CreateProcess bash.exe（不经 cmd，避免 % 展开与引号启发式），
+   脚本作为 -c 参数；-c 已带完整 MSYS PATH 且保持当前工作目录。 */
+static RunResult run_bash_cmd(const char *script, int timeout_ms) {
+    char *line = NULL;
+    int len = 0, cap = 0;
+    sbuf_append_quoted(&line, &len, &cap, g_bash_path);
+    sbuf_append(&line, &len, &cap, " -c ");
+    sbuf_append_quoted(&line, &len, &cap, script);
+    RunResult rr = run_cmdline(line, timeout_ms);
+    free(line);
+    return rr;
+}
+
 /* ============ MCP 协议 ============ */
 /* 注：g_http_mode 已提前到 run_cmd 之前定义（进度通知共用） */
 static __thread SB g_http_resp; /* HTTP 模式：收集响应（每线程独立） */
@@ -563,18 +652,45 @@ static void handle_tools_call(Json *id, Json *params) {
     if (strcmp(tool, "windows_exec") == 0) {
         const char *command = "";
         int timeout_ms = 30000;
+        const char *shell = NULL;
         if (args) {
             Json *c = j_get(args, "command");
             if (c && c->type == 2) command = c->str;
             Json *t = j_get(args, "timeout_ms");
             if (t && t->type == 3) timeout_ms = (int)t->num;
             else if (t && t->type == 2) timeout_ms = atoi(t->str);
+            Json *sh = j_get(args, "shell");
+            if (sh && sh->type == 2 && sh->str && sh->str[0]) shell = sh->str;
         }
         if (!command[0]) {
             Json *r = j_obj();
             j_set(r, "isError", j_bool(1));
             Json *c = j_arr();
             j_add(c, j_text("参数 command 不能为空"));
+            j_set(r, "content", c);
+            send_json(resp_result(id, r));
+            return;
+        }
+        int use_bash = 0;
+        if (shell) {
+            if (_stricmp(shell, "gitbash") == 0 || _stricmp(shell, "bash") == 0 || _stricmp(shell, "git-bash") == 0) use_bash = 1;
+            else if (_stricmp(shell, "cmd") != 0) {
+                Json *r = j_obj();
+                j_set(r, "isError", j_bool(1));
+                Json *c = j_arr();
+                char emsg[160];
+                snprintf(emsg, sizeof(emsg), "shell 参数仅支持 \"cmd\" 或 \"gitbash\"（收到: %.60s）", shell);
+                j_add(c, j_text(emsg));
+                j_set(r, "content", c);
+                send_json(resp_result(id, r));
+                return;
+            }
+        }
+        if (use_bash && !g_bash_path[0]) {
+            Json *r = j_obj();
+            j_set(r, "isError", j_bool(1));
+            Json *c = j_arr();
+            j_add(c, j_text("未找到 git-bash（已检查 Program Files / Program Files (x86) / LocalAppData 下的 Git 安装）；请改用 cmd 语法（省略 shell 或传 shell:\"cmd\"）。"));
             j_set(r, "content", c);
             send_json(resp_result(id, r));
             return;
@@ -590,11 +706,12 @@ static void handle_tools_call(Json *id, Json *params) {
             progress_emit(head);
             g_p_last_ms = GetTickCount();
         }
-        RunResult rr = run_cmd(command, timeout_ms);
-        char prefix[64];
-        if (rr.spawn_err) sprintf(prefix, "[spawn error]");
-        else if (rr.timed_out) sprintf(prefix, "[exit: timeout(%dms) 命令超时被终止]", timeout_ms);
-        else sprintf(prefix, "[exit: %d]", rr.exit_code);
+        RunResult rr = use_bash ? run_bash_cmd(command, timeout_ms) : run_cmd(command, timeout_ms);
+        char prefix[128];
+        const char *shmark = use_bash ? " [shell: gitbash]" : "";
+        if (rr.spawn_err) sprintf(prefix, "[spawn error]%s", shmark);
+        else if (rr.timed_out) sprintf(prefix, "[exit: timeout(%dms) 命令超时被终止]%s", timeout_ms, shmark);
+        else sprintf(prefix, "[exit: %d]%s", rr.exit_code, shmark);
         char *text = (char *)malloc(strlen(prefix) + (rr.output ? strlen(rr.output) : 0) + 16);
         sprintf(text, "%s\n%s", prefix, rr.output ? rr.output : "");
         Json *r = j_obj();
@@ -635,8 +752,16 @@ static void handle_message(const char *line) {
         j_set(r, "capabilities", caps);
         Json *info = j_obj();
         j_set(info, "name", j_str("win-exec-mcp"));
-        j_set(info, "version", j_str("0.1.0"));
+        j_set(info, "version", j_str("0.3.6"));
         j_set(r, "serverInfo", info);
+        char instr[600];
+        snprintf(instr, sizeof(instr),
+            "windows_exec 在 Windows 主机上执行命令：默认 cmd 语法。%s"
+            "长命令的输出会以 progress 通知实时推送，最终结果包含完整输出与退出码。",
+            g_bash_path[0]
+                ? "本机已安装 git-bash：需要 Linux 风格命令或 .sh 脚本时请传 shell:\"gitbash\"（服务端自动定位 bash.exe，不会误用 WSL）。"
+                : "本机未检测到 git-bash。");
+        j_set(r, "instructions", j_str(instr));
         send_json(resp_result(id, r));
     } else if (strcmp(m, "notifications/initialized") == 0 || strcmp(m, "initialized") == 0) {
         /* 无响应 */
@@ -647,11 +772,17 @@ static void handle_message(const char *line) {
         Json *tools = j_arr();
         Json *t = j_obj();
         j_set(t, "name", j_str("windows_exec"));
-        j_set(t, "description", j_str(
+        char desc[1200];
+        snprintf(desc, sizeof(desc),
             "在 Windows 客户端执行一条命令（供 Remote-SSH/Linux 端的 agent 调用，跑在用户电脑的 Windows 上）。"
             "任何 Windows 命令/CLI/脚本皆可（如 dir、ipconfig、PowerShell、adb、esptool 等）；"
             "结果返回 stdout/stderr 和退出码。"
-            "参数: command(必填, Windows 命令字符串, 支持 && 和管道), timeout_ms(可选, 超时毫秒, 默认 30000)。"));
+            "参数: command(必填, Windows 命令字符串, 支持 && 和管道), timeout_ms(可选, 超时毫秒, 默认 30000), "
+            "shell(可选, \"cmd\"(默认) 或 \"gitbash\")。%s",
+            g_bash_path[0]
+                ? "【环境】本机已安装 git-bash：需要 Linux 风格命令（grep/sed/awk/ls/单引号/$变量 等）或 .sh 脚本时，传 shell:\"gitbash\" 即可（服务端自动定位 bash.exe，无需自行拼路径与引号，也不会误用 WSL）。"
+                : "【环境】本机未检测到 git-bash：请使用 cmd/Windows 语法。");
+        j_set(t, "description", j_str(desc));
         Json *schema = j_obj();
         j_set(schema, "type", j_str("object"));
         Json *props = j_obj();
@@ -663,6 +794,10 @@ static void handle_message(const char *line) {
         j_set(p2, "type", j_str("number"));
         j_set(p2, "description", j_str("超时毫秒，默认 30000"));
         j_set(props, "timeout_ms", p2);
+        Json *p3 = j_obj();
+        j_set(p3, "type", j_str("string"));
+        j_set(p3, "description", j_str("执行 shell：\"cmd\"(默认) 或 \"gitbash\"（Linux 风格命令 / .sh 脚本用）"));
+        j_set(props, "shell", p3);
         j_set(schema, "properties", props);
         Json *req = j_arr();
         j_add(req, j_str("command"));
@@ -984,6 +1119,7 @@ static int http_main(int port, const char *token, DWORD parent_pid) {
 }
 
 int main(int argc, char **argv) {
+    detect_git_bash();
     if (argc >= 3 && strcmp(argv[1], "--http") == 0) {
         const char *token = NULL;
         DWORD parent_pid = 0;

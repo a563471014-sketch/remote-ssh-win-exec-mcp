@@ -23,7 +23,7 @@ returns over the MCP channel (optionally through the SSH encrypted tunnel).
 
 | tool | params | returns |
 |---|---|---|
-| `windows_exec` | `command` (required, cmd syntax, `&&` / pipes ok), `timeout_ms` (default 30000) | `[exit: N]` + stdout/stderr (UTF-8) |
+| `windows_exec` | `command` (required, cmd syntax, `&&` / pipes ok), `timeout_ms` (default 30000), `shell` (`cmd` default / `gitbash` for Linux-style commands and .sh scripts) | `[exit: N]` + stdout/stderr (UTF-8) |
 
 ## Install (three ways)
 

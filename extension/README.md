@@ -42,7 +42,7 @@ code --install-extension win-exec-mcp-0.3.6.vsix
 
 - **stdio（`win-exec-mcp`）**：注册到用户级 `mcp.json`（location: local），Windows 客户端拉起进程，走 Remote-SSH 通道 —— VS Code 内建 agent 可用
 - **http**：注册到项目级 `.vscode/mcp.json` / `.mcp.json`，默认 URL `http://127.0.0.1:<ssh.localPort>/mcp`（SSH 回环隧道，与 IP 无关；设置 `http.host` 后改为局域网直连）—— 供 VS Code 之外的客户端（Claude Code 等）使用；进程仅远端窗口自动拉起
-- 工具：`windows_exec(command, timeout_ms?=30000)`，支持 `&&`、管道等 cmd 语法
+- 工具：`windows_exec(command, timeout_ms?=30000, shell?="cmd")`，支持 `&&`、管道等 cmd 语法；`shell:"gitbash"` 可用 git-bash 执行 Linux 风格命令 / .sh 脚本（自动检测本机 git-bash，未安装时明确报错）
 
 ## 命令
 
