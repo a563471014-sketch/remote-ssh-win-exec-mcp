@@ -288,6 +288,113 @@ static char *gbk_to_utf8(const char *gbk, int len) {
     return u;
 }
 
+/* ============ 进度通知（notifications/progress）——自动流式输出 ============ */
+/* 当客户端在 tools/call 的 params._meta.progressToken 里带令牌时：
+   - stdio：命令执行期间把新输出按行作为 progress 通知实时写到 stdout；
+   - HTTP ：响应提前以 SSE 流打开，进度事件边执行边推送，最后再发最终 result。
+   客户端（VS Code / Claude Code 等）在工具调用 UI 上实时显示，调用方无需做任何事。
+   无 token 时行为与旧版完全一致（协议要求：没有 token 不应主动发 progress）。 */
+static int g_http_mode = 0;               /* 1 = HTTP 服务模式 */
+static __thread char   g_ptok[256];       /* 本次调用的 progressToken（字符串型） */
+static __thread int    g_ptok_num = 0;    /* token 是数字型 */
+static __thread double g_ptok_numval = 0; /* 数字型 token 的值 */
+static __thread int    g_pseq = 0;        /* progress 递增序号 */
+static __thread DWORD  g_p_last_ms = 0;   /* 上次发送时间（限流 ~10/s） */
+static __thread int    g_streaming = 0;   /* HTTP：本次响应已开始 SSE 流式 */
+static __thread SOCKET g_stream_sock = 0; /* HTTP：流式响应所用连接 */
+
+static int progress_begin(Json *params) {
+    g_ptok[0] = 0; g_ptok_num = 0; g_ptok_numval = 0; g_pseq = 0; g_p_last_ms = 0;
+    Json *meta = params ? j_get(params, "_meta") : NULL;
+    Json *t = meta ? j_get(meta, "progressToken") : NULL;
+    if (!t) return 0;
+    if (t->type == 2 && t->str && t->str[0]) {
+        strncpy(g_ptok, t->str, sizeof(g_ptok) - 1);
+        g_ptok[sizeof(g_ptok) - 1] = 0;
+        return 1;
+    }
+    if (t->type == 3) { g_ptok_num = 1; g_ptok_numval = t->num; return 1; }
+    return 0;
+}
+static int progress_on(void) { return g_ptok[0] || g_ptok_num; }
+
+/* 发送一条 notifications/progress（text 必须是合法 UTF-8） */
+static void progress_emit(const char *text) {
+    if (!progress_on()) return;
+    Json *n = j_obj();
+    j_set(n, "jsonrpc", j_str("2.0"));
+    j_set(n, "method", j_str("notifications/progress"));
+    Json *p = j_obj();
+    if (g_ptok_num) j_set(p, "progressToken", j_num(g_ptok_numval));
+    else j_set(p, "progressToken", j_str(g_ptok));
+    j_set(p, "progress", j_num(++g_pseq));
+    j_set(p, "message", j_str(text));
+    j_set(n, "params", p);
+    char *s = json_serialize(n);
+    if (g_http_mode) {
+        if (g_streaming) {
+            char *sse = (char *)malloc(strlen(s) + 64);
+            int sn = sprintf(sse, "event: message\ndata: %s\n\n", s);
+            send(g_stream_sock, sse, sn, 0);
+            free(sse);
+        }
+    } else {
+        printf("%s\n", s);
+        fflush(stdout);
+    }
+    free(s);
+    j_free(n);
+}
+
+/* 原始输出 → UTF-8 副本（合法 UTF-8 直接用；否则按 GBK 转） */
+static char *to_utf8_dup(const char *s, int len) {
+    char *r;
+    if (len <= 0) return NULL;
+    if (utf8_valid(s, len)) {
+        r = (char *)malloc(len + 1);
+        memcpy(r, s, len); r[len] = 0;
+        return r;
+    }
+    r = gbk_to_utf8(s, len);
+    if (r) return r;
+    r = (char *)malloc(len + 1);
+    memcpy(r, s, len); r[len] = 0;
+    return r;
+}
+
+/* run_cmd 每读到一段输出后调用：把 [*emitted, olen) 内"最后一个换行前"的新内容发出去。
+   force=1（命令结束）时无换行也发、无视限流。消息太长时只发尾部 1200 字节（UI 是实时尾部视图）。 */
+static void progress_scan(const char *out, int olen, int *emitted, int force) {
+    if (!progress_on() || olen <= *emitted) return;
+    int end;
+    if (force) {
+        end = olen;
+    } else {
+        int i = olen - 1;
+        while (i >= *emitted && out[i] != '\n') i--;
+        if (i < *emitted) return; /* 暂无完整的新行 */
+        end = i + 1;
+    }
+    DWORD now = GetTickCount();
+    if (!force && now - g_p_last_ms < 100) return; /* 限流：~10 条/秒 */
+    g_p_last_ms = now;
+    const char *seg = out + *emitted;
+    int seg_len = end - *emitted;
+    if (seg_len > 1200) {
+        seg += seg_len - 1200;
+        seg_len = 1200;
+        while (seg_len > 0 && ((unsigned char)*seg & 0xC0) == 0x80) { seg++; seg_len--; }
+    }
+    char *u = to_utf8_dup(seg, seg_len);
+    if (u) {
+        int ul = (int)strlen(u);
+        while (ul > 0 && (u[ul - 1] == '\n' || u[ul - 1] == '\r')) u[--ul] = 0;
+        if (ul > 0) progress_emit(u);
+        free(u);
+    }
+    *emitted = end;
+}
+
 /* ============ 执行 Windows 命令（CreateProcess + 管道 + 超时） ============ */
 typedef struct {
     char *output;   /* UTF-8 文本 */
@@ -349,6 +456,7 @@ static RunResult run_cmd(const char *cmd, int timeout_ms) {
     out[0] = 0;
     int olen = 0, ocap = 1;
     int truncated = 0;
+    int emitted = 0; /* 已经通过进度通知发出的字节数 */
     char buf[4096];
     DWORD rd;
     /* 主循环：等待进程 + 读管道（非阻塞方式） */
@@ -360,6 +468,7 @@ static RunResult run_cmd(const char *cmd, int timeout_ms) {
         if (PeekNamedPipe(hOutR, NULL, 0, NULL, &avail, NULL) && avail > 0) {
             if (ReadFile(hOutR, buf, sizeof(buf), &rd, NULL) && rd > 0) {
                 out_append(&out, &olen, &ocap, buf, (int)rd, &truncated);
+                progress_scan(out, olen, &emitted, 0);
             }
         }
         DWORD wait = WaitForSingleObject(pi.hProcess, 50);
@@ -368,6 +477,7 @@ static RunResult run_cmd(const char *cmd, int timeout_ms) {
             while (PeekNamedPipe(hOutR, NULL, 0, NULL, &avail, NULL) && avail > 0) {
                 if (ReadFile(hOutR, buf, sizeof(buf), &rd, NULL) && rd > 0) {
                     out_append(&out, &olen, &ocap, buf, (int)rd, &truncated);
+                    progress_scan(out, olen, &emitted, 0);
                 }
             }
             alive = 0;
@@ -398,6 +508,9 @@ static RunResult run_cmd(const char *cmd, int timeout_ms) {
         out_append(&out, &olen, &ocap, "\n[output truncated]\n", 20, &truncated);
     }
 
+    /* 收尾：把剩余未发的输出 flush 成最后一条进度 */
+    progress_scan(out, olen, &emitted, 1);
+
     /* 编码处理：合法 UTF-8 原样，否则按 GBK 转 UTF-8 */
     if (olen > 0 && utf8_valid(out, olen)) {
         rr.output = out;
@@ -410,7 +523,7 @@ static RunResult run_cmd(const char *cmd, int timeout_ms) {
 }
 
 /* ============ MCP 协议 ============ */
-static int g_http_mode = 0;
+/* 注：g_http_mode 已提前到 run_cmd 之前定义（进度通知共用） */
 static __thread SB g_http_resp; /* HTTP 模式：收集响应（每线程独立） */
 static void send_json(Json *j) {
     char *s = json_serialize(j);
@@ -445,6 +558,8 @@ static void handle_tools_call(Json *id, Json *params) {
     Json *args = j_get(params, "arguments");
     const char *tool = (name && name->type == 2) ? name->str : "";
 
+    progress_begin(params); /* 客户端带 progressToken 时启用自动流式输出 */
+
     if (strcmp(tool, "windows_exec") == 0) {
         const char *command = "";
         int timeout_ms = 30000;
@@ -464,6 +579,17 @@ static void handle_tools_call(Json *id, Json *params) {
             send_json(resp_result(id, r));
             return;
         }
+        /* 先推一条"开始执行"：长命令的静默期也有即时反馈 */
+        if (progress_on()) {
+            char head[200];
+            snprintf(head, sizeof(head), "▶ 开始执行: %.140s", command);
+            int hl = (int)strlen(head);
+            while (hl > 0 && ((unsigned char)head[hl - 1] & 0xC0) == 0x80) hl--;
+            if (hl > 0 && (unsigned char)head[hl - 1] >= 0xC0) hl--;
+            head[hl] = 0;
+            progress_emit(head);
+            g_p_last_ms = GetTickCount();
+        }
         RunResult rr = run_cmd(command, timeout_ms);
         char prefix[64];
         if (rr.spawn_err) sprintf(prefix, "[spawn error]");
@@ -478,6 +604,7 @@ static void handle_tools_call(Json *id, Json *params) {
         send_json(resp_result(id, r));
         free(text);
         free(rr.output);
+        g_ptok[0] = 0; g_ptok_num = 0; /* 清理本次进度上下文 */
         return;
     }
 
@@ -761,18 +888,43 @@ static DWORD WINAPI http_client_thread(LPVOID arg) {
         }
         body[copied] = 0;
 
+        /* 带 progressToken 的 tools/call：先开 SSE 流（无 Content-Length，关闭即结束），
+           命令执行期间 progress 事件直接写本连接，最后再发最终 result */
+        int want_progress = 0;
+        {
+            Json *pm = json_parse(body);
+            if (pm) {
+                Json *mth = j_get(pm, "method");
+                if (mth && mth->type == 2 && strcmp(mth->str, "tools/call") == 0) {
+                    Json *pp = j_get(pm, "params");
+                    Json *meta = pp ? j_get(pp, "_meta") : NULL;
+                    if (meta && j_get(meta, "progressToken")) want_progress = 1;
+                }
+                j_free(pm);
+            }
+        }
+        if (want_progress) {
+            int nodelay = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
+            http_send(s, 200, "OK", "text/event-stream", NULL, 0, origin_buf, NULL);
+            g_streaming = 1;
+            g_stream_sock = s;
+        }
+
         g_http_resp.buf = NULL; g_http_resp.len = 0; g_http_resp.cap = 0;
         handle_message(body);
         if (g_http_resp.len > 0) {
             /* VS Code 客户端要求 SSE（text/event-stream）格式响应 */
             char *sse = (char *)malloc(g_http_resp.len + 64);
             int sn = sprintf(sse, "event: message\ndata: %s\n\n", g_http_resp.buf);
-            http_send(s, 200, "OK", "text/event-stream", sse, sn, origin_buf, NULL);
+            if (want_progress) send(s, sse, sn, 0); /* 响应头已随流先行发出，这里只追加事件 */
+            else http_send(s, 200, "OK", "text/event-stream", sse, sn, origin_buf, NULL);
             free(sse);
-        } else {
+        } else if (!want_progress) {
             /* notification 等无响应消息：202 Accepted 无 body */
             http_send(s, 202, "Accepted", NULL, NULL, 0, origin_buf, NULL);
         }
+        g_streaming = 0;
         free(g_http_resp.buf);
         free(body);
     } else {
