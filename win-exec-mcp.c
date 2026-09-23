@@ -10,6 +10,7 @@
  * 传输：MCP stdio —— newline-delimited JSON，同时兼容 Content-Length 帧。
  */
 #define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0601 /* Job Object / RegGetValue 等 API 可用性 */
 #include <winsock2.h>
 #include <windows.h>
 #include <winreg.h>
@@ -401,9 +402,34 @@ static __thread int    g_pseq = 0;        /* progress 递增序号 */
 static __thread DWORD  g_p_last_ms = 0;   /* 上次发送时间（限流 ~10/s） */
 static __thread int    g_streaming = 0;   /* HTTP：本次响应已开始 SSE 流式 */
 static __thread SOCKET g_stream_sock = 0; /* HTTP：流式响应所用连接 */
+static __thread char   g_cur_reqid[80];   /* 当前 tools/call 的 request id（取消匹配用） */
+static __thread int    g_client_gone = 0; /* 发送失败/管道错误 → 客户端已走，应终止命令 */
+static __thread char  *g_prog_last = NULL;/* 上一条进度消息（相邻去重） */
+static __thread int    g_prog_last_cap = 0;
+/* 可调阈值（环境变量覆盖，见 load_env_config） */
+static int g_prog_ms = 100;             /* WINEXEC_PROGRESS_MS     进度最小间隔毫秒 */
+static int g_prog_bytes = 1200;         /* WINEXEC_PROGRESS_BYTES  单条进度上限字节 */
+static int g_spill_bytes = 512 * 1024;  /* WINEXEC_MAX_RESULT_BYTES 结果超此值落盘（0=关） */
+
+/* ============ 可调阈值（环境变量，启动时读取） ============ */
+static int env_int(const char *name, int def, int lo, int hi) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return def;
+    int v = atoi(s);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
+static void load_env_config(void) {
+    g_prog_ms = env_int("WINEXEC_PROGRESS_MS", 100, 30, 10000);
+    g_prog_bytes = env_int("WINEXEC_PROGRESS_BYTES", 1200, 200, 60000);
+    g_spill_bytes = env_int("WINEXEC_MAX_RESULT_BYTES", 512 * 1024, 0, 1 << 30);
+}
 
 static int progress_begin(Json *params) {
     g_ptok[0] = 0; g_ptok_num = 0; g_ptok_numval = 0; g_pseq = 0; g_p_last_ms = 0;
+    g_client_gone = 0;
+    if (g_prog_last) g_prog_last[0] = 0;
     Json *meta = params ? j_get(params, "_meta") : NULL;
     Json *t = meta ? j_get(meta, "progressToken") : NULL;
     if (!t) return 0;
@@ -416,6 +442,17 @@ static int progress_begin(Json *params) {
     return 0;
 }
 static int progress_on(void) { return g_ptok[0] || g_ptok_num; }
+
+/* 完整发送（大缓冲区可能会分多次写；出错返回 0） */
+static int send_all(SOCKET s, const char *buf, int len) {
+    int off = 0;
+    while (off < len) {
+        int n = send(s, buf + off, len - off, 0);
+        if (n <= 0) return 0;
+        off += n;
+    }
+    return 1;
+}
 
 /* 发送一条 notifications/progress（text 必须是合法 UTF-8） */
 static void progress_emit(const char *text) {
@@ -434,12 +471,13 @@ static void progress_emit(const char *text) {
         if (g_streaming) {
             char *sse = (char *)malloc(strlen(s) + 64);
             int sn = sprintf(sse, "event: message\ndata: %s\n\n", s);
-            send(g_stream_sock, sse, sn, 0);
+            if (!send_all(g_stream_sock, sse, sn)) g_client_gone = 1; /* 连接已断 → 终止命令 */
             free(sse);
         }
     } else {
         printf("%s\n", s);
         fflush(stdout);
+        if (ferror(stdout)) g_client_gone = 1; /* 管道已断 → 终止命令 */
     }
     free(s);
     j_free(n);
@@ -461,8 +499,84 @@ static char *to_utf8_dup(const char *s, int len) {
     return r;
 }
 
+/* 同 to_utf8_dup，但逐行去掉行尾 \r（命令输出多为 CRLF，逐行展示时不需要） */
+static char *to_utf8_lines(const char *s, int len) {
+    char *u = to_utf8_dup(s, len);
+    if (u) {
+        char *w = u;
+        for (char *p = u; *p; p++) {
+            if (*p == '\r' && (p[1] == '\n' || p[1] == 0)) continue;
+            *w++ = *p;
+        }
+        *w = 0;
+    }
+    return u;
+}
+
+/* 组装一条进度消息：按"完整行"取窗口（最近若干行，装进 budget），
+   跳过的内容前置标注 "…[跳过 N 行]…"；单行超长时折叠为 "行首 …[省略 N B]… 行尾"。
+   返回 malloc 的 UTF-8 文本；无可发内容返回 NULL。 */
+static char *build_progress_msg(const char *raw, int rstart, int rend, int budget) {
+    while (rend > rstart && (raw[rend - 1] == '\n' || raw[rend - 1] == '\r')) rend--;
+    if (rend <= rstart) return NULL;
+    int reserve = 48; /* 标注预留 */
+
+    /* 整段放得下：直接转换 */
+    if (rend - rstart <= budget) return to_utf8_lines(raw + rstart, rend - rstart);
+
+    /* 从底部向上收"完整行"，直到再加一行就超过预算 */
+    int keep_start = rend;
+    int e = rend;
+    while (e > rstart) {
+        int ls = e;
+        while (ls > rstart && raw[ls - 1] != '\n') ls--;
+        if (rend - ls > budget - reserve) break; /* 本行放不进 → 停（本行及其上全部跳过） */
+        keep_start = ls;
+        if (ls == rstart) break;
+        e = ls - 1; /* 跳过分隔换行，继续向上一行 */
+    }
+
+    if (keep_start == rend) {
+        /* 底部整行超预算：折叠该行头尾 */
+        int ls = rend;
+        while (ls > rstart && raw[ls - 1] != '\n') ls--;
+        char *u = to_utf8_lines(raw + ls, rend - ls);
+        if (!u) return NULL;
+        int ul = (int)strlen(u);
+        int inner = budget - reserve - 40;
+        if (inner < 64) inner = 64;
+        int head = inner / 2, tail = inner - head;
+        int hl = head;
+        while (hl > 0 && hl < ul && ((unsigned char)u[hl] & 0xC0) == 0x80) hl--;
+        int ts = ul - tail;
+        if (ts < hl) ts = hl;
+        while (ts < ul && ((unsigned char)u[ts] & 0xC0) == 0x80) ts++;
+        int dlines = 0;
+        for (int i = rstart; i < ls; i++) if (raw[i] == '\n') dlines++;
+        if (ls > rstart && dlines == 0) dlines = 1;
+        char *msg = (char *)malloc(ul + 256);
+        int n = 0;
+        if (dlines > 0) n += sprintf(msg + n, "…[跳过 %d 行]…\n", dlines);
+        n += sprintf(msg + n, "%.*s …[省略 %d B]… %s", hl, u, ts - hl, u + ts);
+        free(u);
+        return msg;
+    }
+
+    /* 常规窗口：转换 [keep_start, rend) 并前置跳过标注 */
+    char *u = to_utf8_lines(raw + keep_start, rend - keep_start);
+    if (!u) return NULL;
+    if (keep_start <= rstart) return u;
+    int dlines = 0;
+    for (int i = rstart; i < keep_start; i++) if (raw[i] == '\n') dlines++;
+    if (dlines == 0) dlines = 1;
+    char *msg = (char *)malloc(strlen(u) + 96);
+    sprintf(msg, "…[跳过 %d 行]…\n%s", dlines, u);
+    free(u);
+    return msg;
+}
+
 /* run_cmd 每读到一段输出后调用：把 [*emitted, olen) 内"最后一个换行前"的新内容发出去。
-   force=1（命令结束）时无换行也发、无视限流。消息太长时只发尾部 1200 字节（UI 是实时尾部视图）。 */
+   force=1（命令结束）时无换行也发、无视限流。窗口内只保留完整行，跳过/折叠均有标注。 */
 static void progress_scan(const char *out, int olen, int *emitted, int force) {
     if (!progress_on() || olen <= *emitted) return;
     int end;
@@ -475,23 +589,57 @@ static void progress_scan(const char *out, int olen, int *emitted, int force) {
         end = i + 1;
     }
     DWORD now = GetTickCount();
-    if (!force && now - g_p_last_ms < 100) return; /* 限流：~10 条/秒 */
+    if (!force && now - g_p_last_ms < (DWORD)g_prog_ms) return; /* 限流 */
     g_p_last_ms = now;
-    const char *seg = out + *emitted;
-    int seg_len = end - *emitted;
-    if (seg_len > 1200) {
-        seg += seg_len - 1200;
-        seg_len = 1200;
-        while (seg_len > 0 && ((unsigned char)*seg & 0xC0) == 0x80) { seg++; seg_len--; }
-    }
-    char *u = to_utf8_dup(seg, seg_len);
-    if (u) {
-        int ul = (int)strlen(u);
-        while (ul > 0 && (u[ul - 1] == '\n' || u[ul - 1] == '\r')) u[--ul] = 0;
-        if (ul > 0) progress_emit(u);
-        free(u);
-    }
+    char *msg = build_progress_msg(out, *emitted, end, g_prog_bytes);
     *emitted = end;
+    if (!msg) return;
+    if (msg[0]) {
+        /* 相邻重复去重（高同构输出常见） */
+        if (!g_prog_last || strcmp(msg, g_prog_last) != 0) {
+            progress_emit(msg);
+            int ml = (int)strlen(msg);
+            if (ml + 1 > g_prog_last_cap) {
+                g_prog_last_cap = ml + 64;
+                g_prog_last = (char *)realloc(g_prog_last, g_prog_last_cap);
+            }
+            memcpy(g_prog_last, msg, ml + 1);
+        }
+    }
+    free(msg);
+}
+
+/* 结果超过阈值：全文写 %TEMP%\win-exec-mcp\out-*.log，返回"标注 + 尾部"（失败返回 NULL 走原样） */
+static char *spill_result(const char *text, const char *prefix) {
+    char dir[1024], path[2048];
+    const char *tmp = getenv("TEMP");
+    if (!tmp || !tmp[0]) tmp = getenv("TMP");
+    if (!tmp || !tmp[0]) return NULL;
+    snprintf(dir, sizeof(dir), "%s\\win-exec-mcp", tmp);
+    CreateDirectoryA(dir, NULL);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(path, sizeof(path), "%s\\out-%04d%02d%02d-%02d%02d%02d-%lu.log", dir,
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+             (unsigned long)GetCurrentProcessId());
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return NULL;
+    fwrite(text, 1, strlen(text), fp);
+    fclose(fp);
+    /* 尾部：最后 ~200 行、且不超过 64KB */
+    int total = (int)strlen(text);
+    int cut = total > 65536 ? total - 65536 : 0;
+    int j = total, seen = 0;
+    while (j > cut) {
+        j--;
+        if (text[j] == '\n' && ++seen > 200) { j++; break; }
+    }
+    int tail_start = j;
+    while (tail_start < total && ((unsigned char)text[tail_start] & 0xC0) == 0x80) tail_start++;
+    char *out = (char *)malloc(total - tail_start + strlen(path) + 320);
+    sprintf(out, "%s\n[输出过大：%d 字节；完整日志已存盘：%s（可用 windows_exec 读取/检索）]\n[以下为末尾 %d 字节]\n%s",
+            prefix, total, path, total - tail_start, text + tail_start);
+    return out;
 }
 
 /* ============ 执行 Windows 命令（CreateProcess + 管道 + 超时） ============ */
@@ -500,6 +648,7 @@ typedef struct {
     int exit_code;
     int timed_out;
     int spawn_err;
+    int aborted;    /* 1=客户端取消 2=客户端断开（进程树已终止） */
 } RunResult;
 
 #define MAX_OUTPUT (16 * 1024 * 1024) /* 输出上限，超出截断（仍需继续排空管道，防止子进程写满管道阻塞） */
@@ -518,8 +667,147 @@ static void out_append(char **out, int *olen, int *ocap, const char *buf, int rd
     (*out)[*olen] = 0;
 }
 
+/* ============ 杀进程树 / 取消 / 断连处理 ============ */
+
+/* 备用杀树：taskkill /T /F（Job Object 未能承载时用） */
+static void kill_tree(DWORD pid) {
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "taskkill /T /F /PID %lu", (unsigned long)pid);
+    char *cl = _strdup(cmd);
+    STARTUPINFOA si2 = { sizeof(si2) };
+    PROCESS_INFORMATION pi2 = { 0 };
+    if (CreateProcessA(NULL, cl, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2)) {
+        WaitForSingleObject(pi2.hProcess, 5000);
+        CloseHandle(pi2.hThread);
+        CloseHandle(pi2.hProcess);
+    }
+    free(cl);
+}
+
+/* 终止整棵进程树（超时/取消/断连统一入口） */
+static void terminate_tree(HANDLE job, PROCESS_INFORMATION *pi) {
+    if (job) TerminateJobObject(job, 1);
+    else {
+        TerminateProcess(pi->hProcess, 1);
+        kill_tree(pi->dwProcessId);
+    }
+}
+
+/* ---- 在飞请求表（HTTP：notifications/cancelled → 杀对应进程树） ---- */
+static CRITICAL_SECTION g_inflight_cs;
+static int g_inflight_ready = 0;
+typedef struct { char id[80]; HANDLE job; int cancelled; } Inflight;
+static Inflight g_inflight[16];
+
+static void inflight_add(const char *id, HANDLE job) {
+    if (!g_inflight_ready) return;
+    EnterCriticalSection(&g_inflight_cs);
+    for (int i = 0; i < 16; i++) {
+        if (!g_inflight[i].id[0]) {
+            strncpy(g_inflight[i].id, id, sizeof(g_inflight[i].id) - 1);
+            g_inflight[i].job = job;
+            g_inflight[i].cancelled = 0;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_inflight_cs);
+}
+/* 在锁内直接终止（避免取消线程持有将失效的句柄） */
+static void inflight_terminate(const char *id) {
+    if (!g_inflight_ready) return;
+    EnterCriticalSection(&g_inflight_cs);
+    for (int i = 0; i < 16; i++) {
+        if (g_inflight[i].id[0] && strcmp(g_inflight[i].id, id) == 0) {
+            g_inflight[i].cancelled = 1;
+            if (g_inflight[i].job) TerminateJobObject(g_inflight[i].job, 1);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_inflight_cs);
+}
+/* 摘除条目并返回"期间是否被取消"（owner 在 CloseHandle 前调） */
+static int inflight_finish(const char *id) {
+    int cancelled = 0;
+    if (!g_inflight_ready) return 0;
+    EnterCriticalSection(&g_inflight_cs);
+    for (int i = 0; i < 16; i++) {
+        if (g_inflight[i].id[0] && strcmp(g_inflight[i].id, id) == 0) {
+            cancelled = g_inflight[i].cancelled;
+            g_inflight[i].id[0] = 0;
+            g_inflight[i].job = NULL;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_inflight_cs);
+    return cancelled;
+}
+
+/* ---- stdio：执行期间非阻塞轮询 stdin，捕获 notifications/cancelled ---- */
+static char g_carry[8192];       /* 执行期间读到的半行，待后续补齐 */
+static int g_carry_len = 0;
+static char *g_pending[64];      /* 执行期间读到的完整行（保持顺序） */
+static int g_pending_n = 0;
+
+static int stdio_cancel_pending(const char *reqid) {
+    HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD avail = 0;
+    while (PeekNamedPipe(hin, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+        char tmp[4096];
+        DWORD rd = 0;
+        DWORD want = avail < (DWORD)(sizeof(tmp) - 1) ? avail : (DWORD)(sizeof(tmp) - 1);
+        if (!ReadFile(hin, tmp, want, &rd, NULL) || rd == 0) break;
+        if (g_carry_len + (int)rd >= (int)sizeof(g_carry)) g_carry_len = 0; /* 极端长行：丢弃重来 */
+        memcpy(g_carry + g_carry_len, tmp, rd);
+        g_carry_len += rd;
+        g_carry[g_carry_len] = 0;
+        char *start = g_carry;
+        char *nl;
+        while ((nl = strchr(start, '\n')) != NULL) {
+            int llen = (int)(nl - start);
+            while (llen > 0 && start[llen - 1] == '\r') llen--;
+            char *linebuf = (char *)malloc(llen + 1);
+            memcpy(linebuf, start, llen);
+            linebuf[llen] = 0;
+            int cancel_this = 0;
+            if (llen > 0 && strstr(linebuf, "cancelled") && (!reqid || reqid[0])) {
+                Json *jm = json_parse(linebuf);
+                if (jm) {
+                    Json *mth = j_get(jm, "method");
+                    if (mth && mth->type == 2 && strcmp(mth->str, "notifications/cancelled") == 0) {
+                        Json *pr = j_get(jm, "params");
+                        Json *rq = pr ? j_get(pr, "requestId") : NULL;
+                        if (rq) {
+                            char *rs = json_serialize(rq);
+                            if (!reqid || !reqid[0] || strcmp(rs, reqid) == 0) cancel_this = 1;
+                            free(rs);
+                        }
+                    }
+                    j_free(jm);
+                }
+            }
+            if (cancel_this) {
+                free(linebuf);
+                int rest = g_carry_len - (int)(nl + 1 - g_carry);
+                memmove(g_carry, nl + 1, rest);
+                g_carry_len = rest;
+                g_carry[rest] = 0;
+                return 1;
+            }
+            if (llen > 0 && g_pending_n < 64) g_pending[g_pending_n++] = linebuf;
+            else free(linebuf);
+            start = nl + 1;
+        }
+        int consumed = (int)(start - g_carry);
+        int rest = g_carry_len - consumed;
+        memmove(g_carry, start, rest);
+        g_carry_len = rest;
+        g_carry[rest] = 0;
+    }
+    return 0;
+}
+
 static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
-    RunResult rr = { NULL, -1, 0, 0 };
+    RunResult rr = { NULL, -1, 0, 0, 0 };
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE hOutR = NULL, hOutW = NULL;
     if (!CreatePipe(&hOutR, &hOutW, &sa, 0)) { rr.spawn_err = 1; return rr; }
@@ -550,6 +838,13 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
 
     if (!ok) { rr.spawn_err = 1; CloseHandle(hOutR); return rr; }
 
+    /* Job Object：超时/取消/断连时用 TerminateJobObject 杀整棵进程树。
+       故意不设 KILL_ON_JOB_CLOSE——正常结束时 start /b 起的后台子进程必须存活
+       （"后台+轮询"模式依赖它）；未能加入 job 时退回 TerminateProcess+taskkill /T。 */
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) { CloseHandle(job); job = NULL; }
+    if (job && g_http_mode && g_inflight_ready && g_cur_reqid[0]) inflight_add(g_cur_reqid, job);
+
     /* 读输出（管道阻塞读，进程退出后读到 EOF） */
     char *out = (char *)malloc(1);
     out[0] = 0;
@@ -570,6 +865,19 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
                 progress_scan(out, olen, &emitted, 0);
             }
         }
+        /* 客户端断开（progress 发送失败）→ 终止整树 */
+        if (g_client_gone) {
+            terminate_tree(job, &pi);
+            rr.aborted = 2;
+            alive = 0;
+        }
+        /* stdio：轮询 stdin 里的 notifications/cancelled（HTTP 由独立线程查在飞表） */
+        if (alive && !g_http_mode && stdio_cancel_pending(g_cur_reqid)) {
+            terminate_tree(job, &pi);
+            rr.aborted = 1;
+            alive = 0;
+        }
+        if (!alive) break;
         DWORD wait = WaitForSingleObject(pi.hProcess, 50);
         if (wait != WAIT_TIMEOUT) {
             /* 读完剩余数据 */
@@ -583,16 +891,22 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
         }
         /* 超时检查 */
         if (alive && timeout_ms > 0 && (GetTickCount() - start_ms) > (DWORD)timeout_ms) {
-            TerminateProcess(pi.hProcess, 1);
+            terminate_tree(job, &pi);
             rr.timed_out = 1;
             alive = 0;
         }
     }
-    /* 退出码必须在 CloseHandle 之前获取，否则永远拿不到真实值 */
-    if (!rr.timed_out) {
+    /* 退出码必须在 CloseHandle 之前获取，否则永远拿不到真实值（被终止的情况无意义） */
+    if (!rr.timed_out && !rr.aborted) {
         DWORD code = 0;
         GetExitCodeProcess(pi.hProcess, &code);
         rr.exit_code = (int)code;
+    }
+    if (job) {
+        if (g_http_mode && g_inflight_ready && g_cur_reqid[0]) {
+            if (inflight_finish(g_cur_reqid) && !rr.aborted && !rr.timed_out) rr.aborted = 1; /* 被取消 */
+        }
+        CloseHandle(job); /* 无 kill-on-close：正常结束时后台子进程存活 */
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -607,8 +921,8 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
         out_append(&out, &olen, &ocap, "\n[output truncated]\n", 20, &truncated);
     }
 
-    /* 收尾：把剩余未发的输出 flush 成最后一条进度 */
-    progress_scan(out, olen, &emitted, 1);
+    /* 收尾：把剩余未发的输出 flush 成最后一条进度（被取消/断连时不必再发） */
+    if (!rr.aborted) progress_scan(out, olen, &emitted, 1);
 
     /* 编码处理：合法 UTF-8 原样，否则按 GBK 转 UTF-8 */
     if (olen > 0 && utf8_valid(out, olen)) {
@@ -765,6 +1079,14 @@ static void handle_tools_call(Json *id, Json *params) {
             send_json(resp_result(id, r));
             return;
         }
+        /* 记录本请求 id（stdio 取消轮询 / HTTP 在飞表用） */
+        g_cur_reqid[0] = 0;
+        if (id) {
+            char *rs = json_serialize(id);
+            strncpy(g_cur_reqid, rs, sizeof(g_cur_reqid) - 1);
+            g_cur_reqid[sizeof(g_cur_reqid) - 1] = 0;
+            free(rs);
+        }
         /* 先推一条"开始执行"：长命令的静默期也有即时反馈 */
         if (progress_on()) {
             char head[200];
@@ -777,13 +1099,20 @@ static void handle_tools_call(Json *id, Json *params) {
             g_p_last_ms = GetTickCount();
         }
         RunResult rr = use_bash ? run_bash_cmd(command, timeout_ms) : run_cmd(command, timeout_ms);
-        char prefix[128];
+        char prefix[192];
         const char *shmark = use_bash ? " [shell: gitbash]" : "";
         if (rr.spawn_err) sprintf(prefix, "[spawn error]%s", shmark);
+        else if (rr.aborted == 1) sprintf(prefix, "[exit: cancelled（命令已被调用方取消，进程树已终止）]%s", shmark);
+        else if (rr.aborted == 2) sprintf(prefix, "[exit: client-disconnected（客户端断开，进程树已终止）]%s", shmark);
         else if (rr.timed_out) sprintf(prefix, "[exit: timeout(%dms) 命令超时被终止]%s", timeout_ms, shmark);
         else sprintf(prefix, "[exit: %d]%s", rr.exit_code, shmark);
         char *text = (char *)malloc(strlen(prefix) + (rr.output ? strlen(rr.output) : 0) + 16);
         sprintf(text, "%s\n%s", prefix, rr.output ? rr.output : "");
+        /* 超大结果：全文落盘，只回传"标注 + 尾部"（防 MB 级结果灌满模型上下文与客户端渲染） */
+        if (g_spill_bytes > 0 && (int)strlen(text) > g_spill_bytes) {
+            char *sp = spill_result(text, prefix);
+            if (sp) { free(text); text = sp; }
+        }
         Json *r = j_obj();
         Json *c = j_arr();
         j_add(c, j_text(text));
@@ -822,7 +1151,7 @@ static void handle_message(const char *line) {
         j_set(r, "capabilities", caps);
         Json *info = j_obj();
         j_set(info, "name", j_str("win-exec-mcp"));
-        j_set(info, "version", j_str("0.3.6"));
+        j_set(info, "version", j_str("0.3.7"));
         j_set(r, "serverInfo", info);
         char instr[600];
         snprintf(instr, sizeof(instr),
@@ -835,6 +1164,15 @@ static void handle_message(const char *line) {
         send_json(resp_result(id, r));
     } else if (strcmp(m, "notifications/initialized") == 0 || strcmp(m, "initialized") == 0) {
         /* 无响应 */
+    } else if (strcmp(m, "notifications/cancelled") == 0) {
+        /* 取消在飞请求：HTTP 模式下通过在飞表杀掉对应进程树（stdio 在执行循环里轮询处理） */
+        Json *rq = params ? j_get(params, "requestId") : NULL;
+        if (rq && g_http_mode) {
+            char *rs = json_serialize(rq);
+            inflight_terminate(rs);
+            free(rs);
+        }
+        /* 无响应 */
     } else if (strcmp(m, "ping") == 0) {
         send_json(resp_result(id, j_obj()));
     } else if (strcmp(m, "tools/list") == 0) {
@@ -846,7 +1184,7 @@ static void handle_message(const char *line) {
         snprintf(desc, sizeof(desc),
             "在 Windows 客户端执行一条命令（供 Remote-SSH/Linux 端的 agent 调用，跑在用户电脑的 Windows 上）。"
             "任何 Windows 命令/CLI/脚本皆可（如 dir、ipconfig、PowerShell、adb、esptool 等）；"
-            "结果返回 stdout/stderr 和退出码。"
+            "结果返回 stdout/stderr 和退出码；超大输出（默认 >512KB）自动落盘并只返回尾部与日志路径。"
             "参数: command(必填, Windows 命令字符串, 支持 && 和管道), timeout_ms(可选, 超时毫秒, 默认 30000), "
             "shell(可选, \"cmd\"(默认) 或 \"gitbash\")。%s",
             g_bash_path[0]
@@ -890,6 +1228,29 @@ static char *read_message(void) {
     static int cap = 0;
     int len = 0;
     int c;
+    /* 0) 执行期间已缓存的完整行优先消费 */
+    if (g_pending_n > 0) {
+        char *r = g_pending[0];
+        for (int i = 1; i < g_pending_n; i++) g_pending[i - 1] = g_pending[i];
+        g_pending_n--;
+        return r;
+    }
+    /* 1) 执行期间读到的"半行"：拼上后续字节补齐本行 */
+    if (g_carry_len > 0) {
+        int cap2 = g_carry_len + 128;
+        char *r = (char *)malloc(cap2);
+        int n2 = g_carry_len;
+        memcpy(r, g_carry, n2);
+        g_carry_len = 0;
+        while ((c = getchar()) != EOF) {
+            if (c == '\n') break;
+            if (c == '\r') continue;
+            if (n2 + 1 >= cap2) { cap2 *= 2; r = (char *)realloc(r, cap2); }
+            r[n2++] = (char)c;
+        }
+        r[n2] = 0;
+        return r;
+    }
     /* 探测 Content-Length 头 */
     {
         /* 读第一行判断 */
@@ -978,7 +1339,7 @@ static char *http_header(const char *headers, const char *name, char *out, int o
     return NULL;
 }
 
-static void http_send(SOCKET s, int status, const char *status_text,
+static int http_send(SOCKET s, int status, const char *status_text,
                       const char *content_type, const char *body, int body_len,
                       const char *origin, const char *allow) {
     char head[2048];
@@ -997,8 +1358,9 @@ static void http_send(SOCKET s, int status, const char *status_text,
     n += sprintf(head + n, "Connection: close\r\n");
     if (body && body_len > 0) n += sprintf(head + n, "Content-Length: %d\r\n", body_len);
     n += sprintf(head + n, "\r\n");
-    send(s, head, n, 0);
-    if (body && body_len > 0) send(s, body, body_len, 0);
+    if (!send_all(s, head, n)) return 0;
+    if (body && body_len > 0 && !send_all(s, body, body_len)) return 0;
+    return 1;
 }
 
 static const char *g_token = NULL;
@@ -1122,7 +1484,7 @@ static DWORD WINAPI http_client_thread(LPVOID arg) {
             /* VS Code 客户端要求 SSE（text/event-stream）格式响应 */
             char *sse = (char *)malloc(g_http_resp.len + 64);
             int sn = sprintf(sse, "event: message\ndata: %s\n\n", g_http_resp.buf);
-            if (want_progress) send(s, sse, sn, 0); /* 响应头已随流先行发出，这里只追加事件 */
+            if (want_progress) send_all(s, sse, sn); /* 响应头已随流先行发出，这里只追加事件 */
             else http_send(s, 200, "OK", "text/event-stream", sse, sn, origin_buf, NULL);
             free(sse);
         } else if (!want_progress) {
@@ -1189,6 +1551,9 @@ static int http_main(int port, const char *token, DWORD parent_pid) {
 }
 
 int main(int argc, char **argv) {
+    load_env_config();
+    InitializeCriticalSection(&g_inflight_cs);
+    g_inflight_ready = 1;
     detect_git_bash();
     if (argc >= 3 && strcmp(argv[1], "--http") == 0) {
         const char *token = NULL;

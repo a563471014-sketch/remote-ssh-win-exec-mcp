@@ -25,6 +25,13 @@ returns over the MCP channel (optionally through the SSH encrypted tunnel).
 |---|---|---|
 | `windows_exec` | `command` (required, cmd syntax, `&&` / pipes ok), `timeout_ms` (default 30000), `shell` (`cmd` default / `gitbash` for Linux-style commands and .sh scripts) | `[exit: N]` + stdout/stderr (UTF-8) |
 
+## Behavior notes
+
+- **Live output**: long-running commands stream output to the client via `notifications/progress` (when the client sends a `progressToken` — VS Code does). Messages are line-aligned, rate-limited (~10/s), and mark skipped content as `…[skipped N lines]…`; the final result still carries the full output.
+- **Large results**: outputs over 512KB are spilled to `%TEMP%\win-exec-mcp\out-<timestamp>.log`; the tool result returns the tail plus the full log path.
+- **Termination**: timeout, client cancellation (`notifications/cancelled`) or client disconnect terminate the **whole process tree** (Job Object, `taskkill /T` fallback). Deliberately-detached background jobs (`start /b …`) survive normal completion.
+- **Environment variables**: `WINEXEC_PROGRESS_MS` (default 100), `WINEXEC_PROGRESS_BYTES` (default 1200), `WINEXEC_MAX_RESULT_BYTES` (default 524288, `0` disables spilling), `WINEXEC_GITBASH` (explicit `bash.exe` path override), `WINEXEC_DEBUG` (startup diagnostics to stderr).
+
 ## Install (three ways)
 
 **A. VS Code extension (.vsix)** — consent dialog, then full auto config:

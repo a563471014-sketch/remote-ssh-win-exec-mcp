@@ -26,7 +26,7 @@ Self-contained extension (bundled exe + full C source code) that lets AI agents 
 ## 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.3.6.vsix
+code --install-extension win-exec-mcp-0.3.7.vsix
 ```
 
 → **Reload Window** → 首次激活弹窗，按用途二选一：
@@ -43,6 +43,10 @@ code --install-extension win-exec-mcp-0.3.6.vsix
 - **stdio（`win-exec-mcp`）**：注册到用户级 `mcp.json`（location: local），Windows 客户端拉起进程，走 Remote-SSH 通道 —— VS Code 内建 agent 可用
 - **http**：注册到项目级 `.vscode/mcp.json` / `.mcp.json`，默认 URL `http://127.0.0.1:<ssh.localPort>/mcp`（SSH 回环隧道，与 IP 无关；设置 `http.host` 后改为局域网直连）—— 供 VS Code 之外的客户端（Claude Code 等）使用；进程仅远端窗口自动拉起
 - 工具：`windows_exec(command, timeout_ms?=30000, shell?="cmd")`，支持 `&&`、管道等 cmd 语法；`shell:"gitbash"` 可用 git-bash 执行 Linux 风格命令 / .sh 脚本（自动检测本机 git-bash，未安装时明确报错）
+- 长命令输出实时推送（客户端带 progressToken 时；按完整行 + 限流 + `跳过 N 行` 标注），最终结果仍含完整输出
+- 结果超 512KB 自动落盘（`%TEMP%\win-exec-mcp\out-*.log`），只回传尾部与日志路径
+- 超时 / 客户端取消 / 断连 → 终止**整棵进程树**（Job Object；兜底 taskkill /T）
+- 环境变量：`WINEXEC_PROGRESS_MS` / `WINEXEC_PROGRESS_BYTES` / `WINEXEC_MAX_RESULT_BYTES`（0=关闭落盘）/ `WINEXEC_GITBASH` / `WINEXEC_DEBUG`
 
 ## 命令
 
