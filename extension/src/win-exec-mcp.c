@@ -12,6 +12,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
+#include <winreg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -288,7 +289,13 @@ static char *gbk_to_utf8(const char *gbk, int len) {
     return u;
 }
 
-/* ============ git-bash 探测（仅显式候选路径；绝不回退 System32\bash.exe=WSL） ============ */
+/* ============ git-bash 探测（多级通用发现；绝不回退 System32\bash.exe=WSL） ============
+   发现顺序（与具体机器无关，靠环境变量/注册表自适配）：
+   0) WINEXEC_GITBASH 环境变量显式覆盖（便携版等特殊安装）
+   1) 注册表 GitForWindows\InstallPath（安装器写入：HKLM/HKCU，含 WOW6432）
+   2) 常见安装目录：ProgramFiles / ProgramFiles(x86) / LocalAppData\Programs / Scoop
+   3) PATH 派生：git.exe 位于 ...\Git\cmd\ 时推 ...\Git\bin\bash.exe；
+      bash.exe 直接在 PATH 时仅接受路径含 \Git\ 的（排除 System32/WindowsApps 的 WSL） */
 static char g_bash_path[MAX_PATH * 2]; /* 空 = 未找到 */
 
 static int file_exists_a(const char *p) {
@@ -296,26 +303,88 @@ static int file_exists_a(const char *p) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-static void detect_git_bash(void) {
-    g_bash_path[0] = 0;
+static int accept_bash(const char *p) {
+    if (!file_exists_a(p)) return 0;
+    strncpy(g_bash_path, p, sizeof(g_bash_path) - 1);
+    g_bash_path[sizeof(g_bash_path) - 1] = 0;
+    return 1;
+}
+
+/* 注册表 HKEY\SOFTWARE\GitForWindows\InstallPath → <path>\bin\bash.exe */
+static int try_reg_hive(HKEY root, const char *subkey) {
+    char val[MAX_PATH * 2];
+    DWORD sz = sizeof(val), type = 0;
+    if (RegGetValueA(root, subkey, "InstallPath", RRF_RT_REG_SZ, &type, val, &sz) != ERROR_SUCCESS)
+        return 0;
+    int l = (int)strlen(val);
+    while (l > 0 && (val[l - 1] == '\\' || val[l - 1] == '/')) val[--l] = 0;
+    if (!l) return 0;
     char cand[MAX_PATH * 2];
-    const char *envs[3];
-    int n = 0;
-    if (getenv("ProgramFiles")) envs[n++] = "ProgramFiles";
-    if (getenv("ProgramFiles(x86)")) envs[n++] = "ProgramFiles(x86)";
-    if (getenv("LocalAppData")) envs[n++] = "LocalAppData";
-    for (int i = 0; i < n; i++) {
+    snprintf(cand, sizeof(cand), "%s\\bin\\bash.exe", val);
+    return accept_bash(cand);
+}
+
+static int contains_ci(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++)
+        if (_strnicmp(p, needle, nl) == 0) return 1;
+    return 0;
+}
+
+static int detect_try_all(void) {
+    char cand[MAX_PATH * 2];
+    char found[MAX_PATH * 2];
+
+    /* 0) 显式覆盖 */
+    const char *ov = getenv("WINEXEC_GITBASH");
+    if (ov && ov[0] && accept_bash(ov)) return 1;
+
+    /* 1) 注册表（安装器写入的最权威来源） */
+    if (try_reg_hive(HKEY_LOCAL_MACHINE, "SOFTWARE\\GitForWindows")) return 1;
+    if (try_reg_hive(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\GitForWindows")) return 1;
+    if (try_reg_hive(HKEY_CURRENT_USER, "SOFTWARE\\GitForWindows")) return 1;
+    if (try_reg_hive(HKEY_CURRENT_USER, "SOFTWARE\\WOW6432Node\\GitForWindows")) return 1;
+
+    /* 2) 常见安装目录 */
+    const char *envs[3] = { "ProgramFiles", "ProgramFiles(x86)", "LocalAppData" };
+    for (int i = 0; i < 3; i++) {
         const char *dir = getenv(envs[i]);
+        if (!dir || !dir[0]) continue;
         if (strcmp(envs[i], "LocalAppData") == 0)
             snprintf(cand, sizeof(cand), "%s\\Programs\\Git\\bin\\bash.exe", dir);
         else
             snprintf(cand, sizeof(cand), "%s\\Git\\bin\\bash.exe", dir);
-        if (file_exists_a(cand)) {
-            strncpy(g_bash_path, cand, sizeof(g_bash_path) - 1);
-            g_bash_path[sizeof(g_bash_path) - 1] = 0;
-            return;
+        if (accept_bash(cand)) return 1;
+    }
+    const char *up = getenv("USERPROFILE");
+    if (up && up[0]) {
+        snprintf(cand, sizeof(cand), "%s\\scoop\\apps\\git\\current\\bin\\bash.exe", up);
+        if (accept_bash(cand)) return 1;
+    }
+
+    /* 3) PATH 派生 */
+    DWORD sp = SearchPathA(NULL, "git.exe", NULL, (DWORD)sizeof(found), found, NULL);
+    if (sp > 0 && sp < (DWORD)sizeof(found)) {
+        size_t l = strlen(found);
+        if (l > 12 && _stricmp(found + l - 12, "\\cmd\\git.exe") == 0) {
+            found[l - 12] = 0; /* 去掉 \cmd\git.exe */
+            snprintf(cand, sizeof(cand), "%s\\bin\\bash.exe", found);
+            if (accept_bash(cand)) return 1;
         }
     }
+    sp = SearchPathA(NULL, "bash.exe", NULL, (DWORD)sizeof(found), found, NULL);
+    if (sp > 0 && sp < (DWORD)sizeof(found) && contains_ci(found, "\\git\\")) {
+        if (accept_bash(found)) return 1; /* 仅接受 Git 目录下的 bash（排除 WSL） */
+    }
+
+    return 0;
+}
+
+static void detect_git_bash(void) {
+    g_bash_path[0] = 0;
+    detect_try_all();
+    if (getenv("WINEXEC_DEBUG")) /* 诊断开关：设了就能在日志里看到探到了什么 */
+        fprintf(stderr, "[win-exec-mcp] git-bash: %s\n", g_bash_path[0] ? g_bash_path : "(not found)");
 }
 
 /* ============ 进度通知（notifications/progress）——自动流式输出 ============ */
@@ -686,11 +755,12 @@ static void handle_tools_call(Json *id, Json *params) {
                 return;
             }
         }
+        if (use_bash && !g_bash_path[0]) detect_git_bash(); /* 用户可能刚装好 Git：重探一次 */
         if (use_bash && !g_bash_path[0]) {
             Json *r = j_obj();
             j_set(r, "isError", j_bool(1));
             Json *c = j_arr();
-            j_add(c, j_text("未找到 git-bash（已检查 Program Files / Program Files (x86) / LocalAppData 下的 Git 安装）；请改用 cmd 语法（省略 shell 或传 shell:\"cmd\"）。"));
+            j_add(c, j_text("未找到 git-bash（已检查注册表 GitForWindows、常见安装目录与 PATH）；请改用 cmd 语法（省略 shell 或传 shell:\"cmd\"），或设置环境变量 WINEXEC_GITBASH 指向 bash.exe。"));
             j_set(r, "content", c);
             send_json(resp_result(id, r));
             return;
