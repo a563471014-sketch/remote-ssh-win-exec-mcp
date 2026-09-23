@@ -1517,7 +1517,7 @@ static DWORD WINAPI parent_watchdog(LPVOID arg) {
     return 0;
 }
 
-static int http_main(int port, const char *token, DWORD parent_pid) {
+static int http_main(int port, const char *token, DWORD parent_pid, const char *bind_addr) {
     g_http_mode = 1;
     g_token = token;
     if (parent_pid) {
@@ -1529,18 +1529,24 @@ static int http_main(int port, const char *token, DWORD parent_pid) {
     SOCKET ls = socket(AF_INET, SOCK_STREAM, 0);
     if (ls == INVALID_SOCKET) { fprintf(stderr, "socket failed\n"); return 1; }
     int one = 1;
+    /* Windows 独占绑定：同端口第二个实例 bind 直接失败退出，避免多实例共享端口收不到连接 */
+#ifdef SO_EXCLUSIVEADDRUSE
+    setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof(one));
+#else
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+#endif
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    /* 默认只绑回环（SSH 隧道场景足够且更安全）；--bind <addr> 可显式指定（如 0.0.0.0 / 局域网 IP） */
+    addr.sin_addr.s_addr = (bind_addr && *bind_addr) ? inet_addr(bind_addr) : htonl(0x7f000001); /* 127.0.0.1 */
     addr.sin_port = htons((unsigned short)port);
     if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        fprintf(stderr, "bind port %d failed\n", port);
+        fprintf(stderr, "bind %s:%d failed (error %d)\n", (bind_addr && *bind_addr) ? bind_addr : "127.0.0.1", port, WSAGetLastError());
         return 1;
     }
     if (listen(ls, 16) != 0) { fprintf(stderr, "listen failed\n"); return 1; }
-    fprintf(stderr, "win-exec-mcp HTTP listening on port %d (token: %s)\n", port, g_token ? "set" : "none");
+    fprintf(stderr, "win-exec-mcp HTTP listening on %s:%d (token: %s)\n", (bind_addr && *bind_addr) ? bind_addr : "127.0.0.1", port, g_token ? "set" : "none");
     for (;;) {
         SOCKET cl = accept(ls, NULL, NULL);
         if (cl == INVALID_SOCKET) continue;
@@ -1557,12 +1563,14 @@ int main(int argc, char **argv) {
     detect_git_bash();
     if (argc >= 3 && strcmp(argv[1], "--http") == 0) {
         const char *token = NULL;
+        const char *bind_addr = NULL;
         DWORD parent_pid = 0;
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) token = argv[i + 1];
+            else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) bind_addr = argv[i + 1];
             else if (strcmp(argv[i], "--parent-pid") == 0 && i + 1 < argc) parent_pid = (DWORD)atol(argv[i + 1]);
         }
-        return http_main(atoi(argv[2]), token, parent_pid);
+        return http_main(atoi(argv[2]), token, parent_pid, bind_addr);
     }
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);

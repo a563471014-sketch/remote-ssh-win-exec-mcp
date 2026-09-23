@@ -46,6 +46,7 @@ code --install-extension win-exec-mcp-0.3.7.vsix
 - 长命令输出实时推送（客户端带 progressToken 时；按完整行 + 限流 + `跳过 N 行` 标注），最终结果仍含完整输出
 - 结果超 512KB 自动落盘（`%TEMP%\win-exec-mcp\out-*.log`），只回传尾部与日志路径
 - 超时 / 客户端取消 / 断连 → 终止**整棵进程树**（Job Object；兜底 taskkill /T）
+- HTTP 服务默认只绑 `127.0.0.1`（`http.host` 可指定局域网），`SO_EXCLUSIVEADDRUSE` 单实例：同端口第二个实例直接 bind 失败退出，不会堆叠
 - 环境变量：`WINEXEC_PROGRESS_MS` / `WINEXEC_PROGRESS_BYTES` / `WINEXEC_MAX_RESULT_BYTES`（0=关闭落盘）/ `WINEXEC_GITBASH` / `WINEXEC_DEBUG`
 
 ## 命令
