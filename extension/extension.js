@@ -46,6 +46,43 @@ function exePath(context) {
     return path.join(context.extensionPath, 'bin', 'win-exec-mcp.exe');
 }
 
+// 固定服务路径：%LOCALAPPDATA%\win-exec-mcp\bin\win-exec-mcp.exe
+// 为什么：防火墙/安全软件按“程序路径”记忆网络授权（弹窗放行、或某次误答的阻止，都绑定在路径上）。
+// 升级=换扩展目录=系统眼中的“全新程序”→ 又要重新弹窗，甚至被静默拦截。
+// exe 固定从同一路径运行后：授权/放行一次即永久有效，升级不再产生新的“程序身份”。
+function stableExePath() {
+    const base = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    return path.join(base, 'win-exec-mcp', 'bin', 'win-exec-mcp.exe');
+}
+
+// 把内置 exe 同步到固定路径（内容不同才覆盖）。正在运行的旧副本会锁住文件 → 保留旧副本继续用，
+// 下次激活再试；任何失败都回退内置路径，保证功能可用。
+function ensureStableExe(context) {
+    const src = exePath(context);
+    const dst = stableExePath();
+    try {
+        if (!fs.existsSync(src)) return dst;
+        const sha = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+        let needCopy = true;
+        try { needCopy = !fs.existsSync(dst) || sha(src) !== sha(dst); } catch (e) { needCopy = true; }
+        if (needCopy) {
+            fs.mkdirSync(path.dirname(dst), { recursive: true });
+            fs.copyFileSync(src, dst);
+            logMsg('stable exe updated: ' + dst);
+        }
+        return dst;
+    } catch (e) {
+        try { if (fs.existsSync(dst)) { logMsg('stable exe in use / update failed, keep existing: ' + (e && e.message)); return dst; } } catch (e2) { }
+        logMsg('stable exe unavailable, fallback to bundled copy: ' + (e && e.message));
+        return src;
+    }
+}
+
+// 服务实际使用的 exe 路径（固定路径优先）
+function serviceExe(context) {
+    try { return ensureStableExe(context); } catch (e) { return exePath(context); }
+}
+
 // 当前宿主应用（VS Code / Trae 等）用户级 mcp.json：从 globalStorageUri 反推用户数据目录
 // （<userData>/User/globalStorage/<publisher>.<name> → <userData>/User/mcp.json）。
 // 不硬编码 %APPDATA%\Code——VS Code 与 Trae 同装时各写各的 mcp.json，避免互相覆盖引发"用户级 mcp 更改"提示
@@ -131,8 +168,8 @@ function ensureUserMcp(context, cfg) {
     if (cfg.get('stdio.enabled', false)) {
         for (const k of containers) {
             const want = k === 'mcpServers'
-                ? { command: exePath(context), args: [] }
-                : { type: 'stdio', command: exePath(context), args: [], location: 'local' };
+                ? { command: serviceExe(context), args: [] }
+                : { type: 'stdio', command: serviceExe(context), args: [], location: 'local' };
             if (JSON.stringify(doc[k][STDIO_ID]) !== JSON.stringify(want)) {
                 doc[k][STDIO_ID] = want;
                 changed = true;
@@ -370,8 +407,21 @@ function isPortListening(port) {
     });
 }
 
+// 连接探测：ok=可连；refused=端口无人监听；timeout=SYN 被静默丢弃（防火墙/安全软件拦截的典型特征）
+function probePort(port, timeoutMs) {
+    return new Promise((resolve) => {
+        const s = net.connect(port, '127.0.0.1');
+        let done = false;
+        const finish = (r) => { if (!done) { done = true; try { s.destroy(); } catch (e) { } resolve(r); } };
+        s.setTimeout(timeoutMs || 1500, () => finish('timeout'));
+        s.on('connect', () => finish('ok'));
+        s.on('error', () => finish('refused'));
+    });
+}
+
 let httpSpawnFails = 0;   // 连续启动失败次数（退避用，避免 watchdog 反复堆进程）
 let httpNextTryAt = 0;    // 退避期内不允许再次启动的时间戳
+let blockedWarned = false; // “回环被拦截”的告警只提示一次（连接成功后复位）
 
 function startHttp(context) {
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
@@ -381,7 +431,7 @@ function startHttp(context) {
         // 已有实例还活着（可能只是正忙/暂不可连）：先等它，绝不再叠加新进程
         if (child && child.exitCode === null) return;
         if (Date.now() < httpNextTryAt) return;
-        const exe = exePath(context);
+        const exe = serviceExe(context);
         if (!fs.existsSync(exe)) {
             vscode.window.showErrorMessage('WinExec MCP: 内置 exe 缺失 ' + exe);
             return;
@@ -392,14 +442,15 @@ function startHttp(context) {
         child = spawn(exe, args, { windowsHide: true, stdio: 'ignore' });
         child.on('error', (err) => vscode.window.showErrorMessage('WinExec MCP 启动失败: ' + err.message));
         child.on('exit', () => { child = null; });
-        // 3 秒后复查：仍不可连则退避重试（15s→30s→60s→120s），避免 watchdog 每 15s 堆一个进程
+        // 3 秒后复查：ok=正常；refused=进程没起来（退避重试）；timeout=回环被拦截（提示一键修复）
         setTimeout(() => {
-            isPortListening(port).then((ok) => {
-                if (ok) { httpSpawnFails = 0; httpNextTryAt = 0; return; }
+            probePort(port, 1500).then((r) => {
+                if (r === 'ok') { httpSpawnFails = 0; httpNextTryAt = 0; blockedWarned = false; return; }
+                if (r === 'timeout') noteFirewallBlocked(context, port);
                 httpSpawnFails++;
                 httpNextTryAt = Date.now() + Math.min(15000 * Math.pow(2, Math.min(httpSpawnFails - 1, 3)), 120000);
-                logMsg('startHttp: port ' + port + ' not listening after spawn (fail #' + httpSpawnFails + '), backoff');
-                if (httpSpawnFails === 5) {
+                logMsg('startHttp: port ' + port + ' probe=' + r + ' after spawn (fail #' + httpSpawnFails + '), backoff');
+                if (httpSpawnFails === 5 && r !== 'timeout') {
                     vscode.window.showWarningMessage('WinExec MCP: HTTP 服务多次启动后仍不可连（端口 ' + port + '），已放慢重试；详见“输出 → WinExec MCP”');
                 }
             });
@@ -409,6 +460,40 @@ function startHttp(context) {
 
 function stopHttp() {
     if (child) { child.kill(); child = null; }
+}
+
+// 回环连接超时 = 本机防火墙/安全软件把该程序的入站连接静默丢弃的典型特征（连 127.0.0.1 都连不上）。
+// 提示一次，并提供一键修复（清除 win-exec 阻止规则 + 放行固定路径 + 清理残留进程；需管理员/UAC）
+function noteFirewallBlocked(context, port) {
+    if (blockedWarned) return;
+    blockedWarned = true;
+    logMsg('probe timeout on 127.0.0.1:' + port + ' - likely blocked by firewall / security suite');
+    vscode.window.showWarningMessage(
+        'WinExec MCP: 服务端口 ' + port + ' 连接超时——本机防火墙/安全软件拦截了 win-exec-mcp（连本机回环都被丢包）。可运行一键修复。',
+        '运行修复（需管理员）', '打开输出'
+    ).then((pick) => {
+        if (pick === '运行修复（需管理员）') runFirewallFix(context);
+        else if (pick === '打开输出' && outChannel) outChannel.show();
+    });
+}
+
+// 以管理员身份运行随扩展分发的 fix-firewall.ps1（弹 UAC；脚本会清除阻止规则、放行固定路径、清理残留进程）
+function runFirewallFix(context) {
+    const script = path.join(context.extensionPath, 'fix-firewall.ps1');
+    if (!fs.existsSync(script)) {
+        vscode.window.showErrorMessage('WinExec MCP: 修复脚本缺失 ' + script);
+        return;
+    }
+    const psArg = '-NoProfile -ExecutionPolicy Bypass -File "' + script.replace(/"/g, '""') + '"';
+    const psCmd = "Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList '" + psArg.replace(/'/g, "''") + "'";
+    try {
+        const p = spawn('powershell.exe', ['-NoProfile', '-Command', psCmd], { windowsHide: true, stdio: 'ignore' });
+        p.on('error', (err) => vscode.window.showErrorMessage('WinExec MCP: 无法启动修复脚本: ' + err.message));
+        vscode.window.showInformationMessage('WinExec MCP: 正在请求管理员权限运行修复（请在 UAC 弹窗点“是”）；完成后重载窗口生效', '重载窗口')
+            .then((pick) => { if (pick === '重载窗口') vscode.commands.executeCommand('workbench.action.reloadWindow'); });
+    } catch (e) {
+        vscode.window.showErrorMessage('WinExec MCP: 无法启动修复脚本: ' + e.message);
+    }
 }
 
 // 用户是否已同意：显式点击过同意，或手动开启了 stdio/http 开关（开关本身就是明确同意）
@@ -628,6 +713,8 @@ function activate(context) {
         vscode.commands.registerCommand('winExecMcp.unregisterProject', unregisterProject),
         // 一键配置服务器端 agent 链路：等价于首次弹窗选“完整配置”
         vscode.commands.registerCommand('winExecMcp.setupExternal', () => enableExternalSetup(context)),
+        // 一键修复防火墙（管理员）：清除 win-exec 阻止规则、放行固定路径、清理残留进程
+        vscode.commands.registerCommand('winExecMcp.fixFirewall', () => runFirewallFix(context)),
         vscode.commands.registerCommand('winExecMcp.setup', async () => {
             if (await askConsent(context)) autoSetup(context);
         })

@@ -26,7 +26,7 @@ Self-contained extension (bundled exe + full C source code) that lets AI agents 
 ## 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.3.7.vsix
+code --install-extension win-exec-mcp-0.3.8.vsix
 ```
 
 → **Reload Window** → 首次激活弹窗，按用途二选一：
@@ -49,12 +49,15 @@ code --install-extension win-exec-mcp-0.3.7.vsix
 - HTTP 服务默认只绑 `127.0.0.1`（`http.host` 可指定局域网），`SO_EXCLUSIVEADDRUSE` 单实例：同端口第二个实例直接 bind 失败退出，不会堆叠
 - 环境变量：`WINEXEC_PROGRESS_MS` / `WINEXEC_PROGRESS_BYTES` / `WINEXEC_MAX_RESULT_BYTES`（0=关闭落盘）/ `WINEXEC_GITBASH` / `WINEXEC_DEBUG`
 
+> **固定服务路径（0.3.8+）**：exe 始终从 `%LOCALAPPDATA%\win-exec-mcp\bin\win-exec-mcp.exe` 运行（升级时原地替换）——防火墙/安全软件按“路径”记授权，放行一次后升级不再重复弹窗、也不会被误拦。若服务连不上（端口连接超时＝被拦截）：运行命令 `WinExec MCP: 修复防火墙权限（管理员）`（UAC 确认后自动清除阻止规则、放行路径并清理残留进程），然后重载窗口。
+
 ## 命令
 
 - `WinExec MCP: Register user mcp.json` — 重写用户级注册
 - `WinExec MCP: 配置服务器端 agent（SSH 转发 + 项目注册）` — 一键开启 `ssh.autoForward` + `project.autoRegister`（= 首次弹窗的“完整配置”）
 - `WinExec MCP: 注册到本项目 / 从本项目移除注册` — 项目级 http 注册（默认 URL 走 SSH 隧道 `127.0.0.1:28848`；设置 `http.host` 后为局域网直连，供 Linux 侧/外部客户端连接）
 - `WinExec MCP: Start / Stop HTTP service`
+- `WinExec MCP: 修复防火墙权限（管理员）` — 清除 win-exec 的防火墙阻止规则、放行固定路径并清理残留进程（UAC 确认；完成后重载窗口）
 
 ## 设置
 

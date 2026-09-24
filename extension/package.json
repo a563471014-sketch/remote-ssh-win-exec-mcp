@@ -2,7 +2,7 @@
 	"name": "win-exec-mcp",
 	"displayName": "WinExec MCP for Remote-SSH",
 	"description": "MCP server bridging Remote-SSH (Linux) AI agents to the Windows host: run Windows commands/CLIs/scripts from Copilot, Claude Code, etc. and get stdout/stderr/exit code back. stdio + HTTP modes, explicit first-run consent, no silent config changes.",
-	"version": "0.3.7",
+	"version": "0.3.8",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/a563471014-sketch/remote-ssh-win-exec-mcp"
@@ -52,6 +52,10 @@
 			{
 				"command": "winExecMcp.setup",
 				"title": "WinExec MCP: Enable / Re-run setup (consent)"
+			},
+			{
+				"command": "winExecMcp.fixFirewall",
+				"title": "WinExec MCP: 修复防火墙权限（管理员）"
 			}
 		],
 		"configuration": {

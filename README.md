@@ -49,7 +49,18 @@ also be enabled later with `WinExec MCP: 配置服务器端 agent`. Once authori
 (including consent given in older versions), remote windows auto-enable and
 repair the chain (RemoteForward + project registration incl. token), asking
 for a window reload only when files were fixed.
-
+**Firewall note (why upgrades used to break).** Windows Firewall and security
+suites remember network permissions **per executable path** — each new
+extension folder looks like a brand-new program (popup again, or worse: a
+silent block that drops even loopback connections, surfacing as "Waiting for
+server to respond to initialize" → "other side closed"). Since **0.3.8** the
+service always runs from a stable path,
+`%LOCALAPPDATA%\win-exec-mcp\bin\win-exec-mcp.exe` (replaced in place on
+upgrades), so a single allow lasts forever. If the service ever becomes
+unreachable, run the command **`WinExec MCP: 修复防火墙权限（管理员）`** (or
+`fix-firewall.cmd` shipped in the extension folder): it deletes stale win-exec
+BLOCK rules, adds an inbound allow for the stable path, and kills leftover
+processes — then reload the window.
 **B. Standalone exe (stdio only, no VS Code):**
 
 ```
@@ -111,6 +122,7 @@ SSH tunnel, no firewall/LAN-IP dependency.
 - `WinExec MCP: 配置服务器端 agent（SSH 转发 + 项目注册）` (one-click = the “+ server-side agents” consent choice)
 - `WinExec MCP: 注册到本项目 / 从本项目移除注册` (project-level http; SSH-tunnel URL by default, LAN IP when `http.host` is set)
 - `WinExec MCP: Start / Stop HTTP service`
+- `WinExec MCP: 修复防火墙权限（管理员）` (clears win-exec firewall blocks + allows the stable path; UAC prompt, then reload)
 
 ## Source layout
 
