@@ -26,7 +26,7 @@ Self-contained extension (bundled exe + full C source code) that lets AI agents 
 ## 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.3.8.vsix
+code --install-extension win-exec-mcp-0.3.9.vsix
 ```
 
 → **Reload Window** → 首次激活弹窗，按用途二选一：
@@ -43,11 +43,11 @@ code --install-extension win-exec-mcp-0.3.8.vsix
 - **stdio（`win-exec-mcp`）**：注册到用户级 `mcp.json`（location: local），Windows 客户端拉起进程，走 Remote-SSH 通道 —— VS Code 内建 agent 可用
 - **http**：注册到项目级 `.vscode/mcp.json` / `.mcp.json`，默认 URL `http://127.0.0.1:<ssh.localPort>/mcp`（SSH 回环隧道，与 IP 无关；设置 `http.host` 后改为局域网直连）—— 供 VS Code 之外的客户端（Claude Code 等）使用；进程仅远端窗口自动拉起
 - 工具：`windows_exec(command, timeout_ms?=30000, shell?="cmd")`，支持 `&&`、管道等 cmd 语法；`shell:"gitbash"` 可用 git-bash 执行 Linux 风格命令 / .sh 脚本（自动检测本机 git-bash，未安装时明确报错）
-- 长命令输出实时推送（客户端带 progressToken 时；按完整行 + 限流 + `跳过 N 行` 标注），最终结果仍含完整输出
+- 长命令输出实时推送（客户端带 progressToken 时；按完整行 + 限流）：0.3.9 起默认 30ms / 60000B 窗口，常见刷屏输出不再出现 `跳过 N 行` 标注；最终结果仍含完整输出
 - 结果超 512KB 自动落盘（`%TEMP%\win-exec-mcp\out-*.log`），只回传尾部与日志路径
 - 超时 / 客户端取消 / 断连 → 终止**整棵进程树**（Job Object；兜底 taskkill /T）
 - HTTP 服务默认只绑 `127.0.0.1`（`http.host` 可指定局域网），`SO_EXCLUSIVEADDRUSE` 单实例：同端口第二个实例直接 bind 失败退出，不会堆叠
-- 环境变量：`WINEXEC_PROGRESS_MS` / `WINEXEC_PROGRESS_BYTES` / `WINEXEC_MAX_RESULT_BYTES`（0=关闭落盘）/ `WINEXEC_GITBASH` / `WINEXEC_DEBUG`
+- 环境变量：`WINEXEC_PROGRESS_MS`（默认 30，进度最小间隔毫秒）/ `WINEXEC_PROGRESS_BYTES`（默认 60000，单条进度窗口字节）/ `WINEXEC_MAX_RESULT_BYTES`（默认 524288，0=关闭落盘）/ `WINEXEC_GITBASH` / `WINEXEC_DEBUG`
 
 > **固定服务路径（0.3.8+）**：exe 始终从 `%LOCALAPPDATA%\win-exec-mcp\bin\win-exec-mcp.exe` 运行（升级时原地替换）——防火墙/安全软件按“路径”记授权，放行一次后升级不再重复弹窗、也不会被误拦。若服务连不上（端口连接超时＝被拦截）：运行命令 `WinExec MCP: 修复防火墙权限（管理员）`（UAC 确认后自动清除阻止规则、放行路径并清理残留进程），然后重载窗口。若机器上装有自带网络防护、且不写 Windows 防火墙规则的第三方安全软件（360、火绒、腾讯电脑管家等），一键修复可能清不掉它的拦截——请在它的信任/放行列表里加入上述固定路径（或临时退出该软件验证）。
 

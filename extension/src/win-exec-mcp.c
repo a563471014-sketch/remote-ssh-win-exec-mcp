@@ -406,9 +406,11 @@ static __thread char   g_cur_reqid[80];   /* 当前 tools/call 的 request id（
 static __thread int    g_client_gone = 0; /* 发送失败/管道错误 → 客户端已走，应终止命令 */
 static __thread char  *g_prog_last = NULL;/* 上一条进度消息（相邻去重） */
 static __thread int    g_prog_last_cap = 0;
-/* 可调阈值（环境变量覆盖，见 load_env_config） */
-static int g_prog_ms = 100;             /* WINEXEC_PROGRESS_MS     进度最小间隔毫秒 */
-static int g_prog_bytes = 1200;         /* WINEXEC_PROGRESS_BYTES  单条进度上限字节 */
+/* 可调阈值（环境变量覆盖，见 load_env_config）。
+   进度参数默认放宽（0.3.9 起 30ms / 60000B）：常见输出速率下每窗口能覆盖全部新行，
+   不再频繁出现 "…[跳过 N 行]…"；要更保守可用环境变量调小/调慢。 */
+static int g_prog_ms = 30;              /* WINEXEC_PROGRESS_MS     进度最小间隔毫秒 */
+static int g_prog_bytes = 60000;        /* WINEXEC_PROGRESS_BYTES  单条进度上限字节 */
 static int g_spill_bytes = 512 * 1024;  /* WINEXEC_MAX_RESULT_BYTES 结果超此值落盘（0=关） */
 
 /* ============ 可调阈值（环境变量，启动时读取） ============ */
@@ -421,8 +423,8 @@ static int env_int(const char *name, int def, int lo, int hi) {
     return v;
 }
 static void load_env_config(void) {
-    g_prog_ms = env_int("WINEXEC_PROGRESS_MS", 100, 30, 10000);
-    g_prog_bytes = env_int("WINEXEC_PROGRESS_BYTES", 1200, 200, 60000);
+    g_prog_ms = env_int("WINEXEC_PROGRESS_MS", 30, 30, 10000);
+    g_prog_bytes = env_int("WINEXEC_PROGRESS_BYTES", 60000, 200, 60000);
     g_spill_bytes = env_int("WINEXEC_MAX_RESULT_BYTES", 512 * 1024, 0, 1 << 30);
 }
 
@@ -1151,7 +1153,7 @@ static void handle_message(const char *line) {
         j_set(r, "capabilities", caps);
         Json *info = j_obj();
         j_set(info, "name", j_str("win-exec-mcp"));
-        j_set(info, "version", j_str("0.3.8"));
+        j_set(info, "version", j_str("0.3.9"));
         j_set(r, "serverInfo", info);
         char instr[600];
         snprintf(instr, sizeof(instr),
