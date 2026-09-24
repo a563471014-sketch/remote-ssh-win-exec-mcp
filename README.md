@@ -60,7 +60,10 @@ upgrades), so a single allow lasts forever. If the service ever becomes
 unreachable, run the command **`WinExec MCP: 修复防火墙权限（管理员）`** (or
 `fix-firewall.cmd` shipped in the extension folder): it deletes stale win-exec
 BLOCK rules, adds an inbound allow for the stable path, and kills leftover
-processes — then reload the window.
+processes — then reload the window. If a third-party security suite (360,
+Huorong, Tencent PC Manager, …) enforces its own network filter instead of
+Windows Firewall rules, add the stable path above to that suite's trust/allow
+list if the one-click fix alone does not clear the block.
 **B. Standalone exe (stdio only, no VS Code):**
 
 ```
