@@ -178,7 +178,7 @@ function sshHost() {
 function sshForwardStatus(cfg, content) {
     const localPort = cfg.get('ssh.localPort', 28848);
     const port = cfg.get('http.port', 38848);
-    const host = vscode.env.remoteName.slice('ssh-remote+'.length);
+    const host = sshHost(); // 1.138：remoteName 无主机后缀，统一走 sshHost（工作区 URI authority）
     if (content === undefined) {
         try { content = fs.readFileSync(path.join(os.homedir(), '.ssh', 'config'), 'utf8'); } catch (e) { return 'missing'; }
     }
@@ -216,6 +216,7 @@ function ensureSshForward(context) {
         const status = sshForwardStatus(cfg, content);
         if (status !== 'missing') return; // ok=已配置；conflict=同入口端口已有其它转发，不静默改（体检会提示）
         const block = '\nHost ' + host + '\n  RemoteForward 127.0.0.1:' + localPort + ' 127.0.0.1:' + port + '\n';
+        if (content.indexOf(block) !== -1) return; // 防重复追加（即使状态判定异常，同一块也不会堆叠）
         if (!fs.existsSync(sshDir)) fs.mkdirSync(sshDir, { recursive: true });
         if (fs.existsSync(sshConfig)) {
             try { fs.copyFileSync(sshConfig, sshConfig + '.bak-winexec'); } catch (e) { }
@@ -535,7 +536,7 @@ async function externalSetupSweep(context) {
             ensureSshForward(context); // 缺失则补写；conflict 时不碰（下面报告）
             const s = sshForwardStatus(cfg);
             if (s === 'conflict') problems.push('~/.ssh/config 同一入口端口已有其它 RemoteForward，需手动调整');
-            else if (s !== 'ok') problems.push('无法写入 ~/.ssh/config（检查文件权限）');
+            else if (s !== 'ok' && sshHost()) problems.push('无法写入 ~/.ssh/config（检查文件权限）');
         }
     }
     if (wantProject) {
