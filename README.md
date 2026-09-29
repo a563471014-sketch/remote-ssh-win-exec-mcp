@@ -28,10 +28,10 @@ returns over the MCP channel (optionally through the SSH encrypted tunnel).
 ## Behavior notes
 
 - **Live output**: long-running commands stream output to the client via `notifications/progress` (when the client sends a `progressToken` — VS Code does). Messages are line-aligned and rate-limited (30 ms, up to 60000 bytes per message by default since 0.3.9 — typical output arrives without gaps); when more accumulates than one window holds, the omitted part is marked as `…[skipped N lines]…`. The final result still carries the full output.
-- **Large results**: outputs over 512KB are spilled to `%TEMP%\win-exec-mcp\out-<timestamp>.log`; the tool result returns the tail plus the full log path.
+- **Large results**: outputs over 512KB are spilled to `%TEMP%\win-exec-mcp\out-<timestamp>-<pid>-<seq>.log`; the tool result returns the tail plus the full log path. Old spill files are reclaimed lazily on each write (keep the newest 20, drop anything older than 7 days — `WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`, `0` disables either rule).
 - **Termination**: timeout, client cancellation (`notifications/cancelled`) or client disconnect terminate the **whole process tree** (Job Object, `taskkill /T` fallback). Deliberately-detached background jobs (`start /b …`) survive normal completion.
 - **HTTP service**: binds `127.0.0.1` by default (`--bind 0.0.0.0` or `winExecMcp.http.host` for LAN) and uses `SO_EXCLUSIVEADDRUSE` — a second instance on the same port fails to bind and exits immediately (no instance pile-up; the extension watchdog never spawns a duplicate while its own child is alive, and backs off on repeated failures).
-- **Environment variables**: `WINEXEC_PROGRESS_MS` (default 30), `WINEXEC_PROGRESS_BYTES` (default 60000), `WINEXEC_MAX_RESULT_BYTES` (default 524288, `0` disables spilling), `WINEXEC_GITBASH` (explicit `bash.exe` path override), `WINEXEC_DEBUG` (startup diagnostics to stderr).
+- **Environment variables**: `WINEXEC_PROGRESS_MS` (default 30), `WINEXEC_PROGRESS_BYTES` (default 60000), `WINEXEC_MAX_RESULT_BYTES` (default 524288, `0` disables spilling), `WINEXEC_SPILL_KEEP` (default 20, spill files kept per directory, `0` disables count-based cleanup), `WINEXEC_SPILL_KEEP_DAYS` (default 7, max age in days, `0` disables age-based cleanup), `WINEXEC_GITBASH` (explicit `bash.exe` path override), `WINEXEC_DEBUG` (startup diagnostics to stderr).
 
 ## Install (three ways)
 

@@ -412,6 +412,9 @@ static __thread int    g_prog_last_cap = 0;
 static int g_prog_ms = 30;              /* WINEXEC_PROGRESS_MS     进度最小间隔毫秒 */
 static int g_prog_bytes = 60000;        /* WINEXEC_PROGRESS_BYTES  单条进度上限字节 */
 static int g_spill_bytes = 512 * 1024;  /* WINEXEC_MAX_RESULT_BYTES 结果超此值落盘（0=关） */
+static int g_spill_keep = 20;           /* WINEXEC_SPILL_KEEP      落盘目录保留个数（0=不按个数清理） */
+static int g_spill_keep_days = 7;       /* WINEXEC_SPILL_KEEP_DAYS 落盘文件最长保留天数（0=不按天数清理） */
+static LONG g_spill_seq = 0;            /* 同毫秒并发序号：文件名唯一化（HTTP 每连接一线程，防同秒覆盖） */
 
 /* ============ 可调阈值（环境变量，启动时读取） ============ */
 static int env_int(const char *name, int def, int lo, int hi) {
@@ -426,6 +429,8 @@ static void load_env_config(void) {
     g_prog_ms = env_int("WINEXEC_PROGRESS_MS", 30, 30, 10000);
     g_prog_bytes = env_int("WINEXEC_PROGRESS_BYTES", 60000, 200, 60000);
     g_spill_bytes = env_int("WINEXEC_MAX_RESULT_BYTES", 512 * 1024, 0, 1 << 30);
+    g_spill_keep = env_int("WINEXEC_SPILL_KEEP", 20, 0, 100000);
+    g_spill_keep_days = env_int("WINEXEC_SPILL_KEEP_DAYS", 7, 0, 3650);
 }
 
 static int progress_begin(Json *params) {
@@ -611,6 +616,65 @@ static void progress_scan(const char *out, int olen, int *emitted, int force) {
     free(msg);
 }
 
+/* ---- 落盘目录卫生（0.3.11）：只清理本程序命名的 out-*.log，best-effort、失败静默 ----
+   时机：每次写入后 lazy 执行（服务是常驻/多窗口进程，没有可靠的退出时机；
+   且文件是要留给模型/人后续 grep 的，不能早删）。策略：
+   - keep > 0：最多保留最近 keep 个（含刚写入的 cur，它永不删除）；
+   - days > 0：删除修改时间早于 days 天的。
+   文件名以 out-YYYYMMDD-HHMMSS-mmm-pid-seq.log 开头 → 字典序即时间序，排序即可。 */
+typedef struct { char name[64]; FILETIME ft; } SpillEnt;
+static int spill_ent_cmp(const void *a, const void *b) {
+    return strcmp(((const SpillEnt *)a)->name, ((const SpillEnt *)b)->name);
+}
+static void spill_sweep(const char *dir, const char *cur, int keep, int days) {
+    if (keep <= 0 && days <= 0) return;
+    char pat[1200];
+    snprintf(pat, sizeof(pat), "%s\\out-*.log", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SpillEnt *ents = NULL;
+    int n = 0, cap = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 64;
+            SpillEnt *t = (SpillEnt *)realloc(ents, sizeof(SpillEnt) * cap);
+            if (!t) break;
+            ents = t;
+        }
+        strncpy(ents[n].name, fd.cFileName, sizeof(ents[n].name) - 1);
+        ents[n].name[sizeof(ents[n].name) - 1] = 0;
+        ents[n].ft = fd.ftLastWriteTime;
+        n++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (!ents) return;
+    ULONGLONG cut = 0;
+    if (days > 0) {
+        FILETIME nowft;
+        GetSystemTimeAsFileTime(&nowft);
+        ULONGLONG now100 = ((ULONGLONG)nowft.dwHighDateTime << 32) | nowft.dwLowDateTime;
+        ULONGLONG span = (ULONGLONG)days * 864000000000ULL; /* 100ns 单位/天 */
+        cut = now100 > span ? now100 - span : 0;
+    }
+    qsort(ents, n, sizeof(SpillEnt), spill_ent_cmp);
+    int drop_oldest = (keep > 0 && n > keep) ? n - keep : 0;
+    for (int i = 0; i < n; i++) {
+        int drop = (i < drop_oldest);
+        if (!drop && cut) {
+            ULONGLONG t = ((ULONGLONG)ents[i].ft.dwHighDateTime << 32) | ents[i].ft.dwLowDateTime;
+            drop = (t < cut);
+        }
+        if (!drop) continue;
+        char full[2048];
+        snprintf(full, sizeof(full), "%s\\%s", dir, ents[i].name);
+        if (cur && _stricmp(full, cur) == 0) continue; /* 绝不删刚写入的文件 */
+        DeleteFileA(full);
+    }
+    free(ents);
+}
+
 /* 结果超过阈值：全文写 %TEMP%\win-exec-mcp\out-*.log，返回"标注 + 尾部"（失败返回 NULL 走原样） */
 static char *spill_result(const char *text, const char *prefix) {
     char dir[1024], path[2048];
@@ -621,13 +685,16 @@ static char *spill_result(const char *text, const char *prefix) {
     CreateDirectoryA(dir, NULL);
     SYSTEMTIME st;
     GetLocalTime(&st);
-    snprintf(path, sizeof(path), "%s\\out-%04d%02d%02d-%02d%02d%02d-%lu.log", dir,
-             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-             (unsigned long)GetCurrentProcessId());
+    /* 毫秒 + PID + 原子序号：同秒并发（HTTP 每连接一线程）也不会互相覆盖 */
+    long seq = (long)InterlockedIncrement(&g_spill_seq);
+    snprintf(path, sizeof(path), "%s\\out-%04d%02d%02d-%02d%02d%02d-%03d-%lu-%ld.log", dir,
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+             (unsigned long)GetCurrentProcessId(), seq);
     FILE *fp = fopen(path, "wb");
     if (!fp) return NULL;
     fwrite(text, 1, strlen(text), fp);
     fclose(fp);
+    spill_sweep(dir, path, g_spill_keep, g_spill_keep_days); /* 顺手回收旧文件（保留最近 N 个 / 过期天数） */
     /* 尾部：最后 ~200 行、且不超过 64KB */
     int total = (int)strlen(text);
     int cut = total > 65536 ? total - 65536 : 0;
@@ -1154,7 +1221,7 @@ static void handle_message(const char *line) {
         j_set(r, "capabilities", caps);
         Json *info = j_obj();
         j_set(info, "name", j_str("win-exec-mcp"));
-        j_set(info, "version", j_str("0.3.10"));
+        j_set(info, "version", j_str("0.3.11"));
         j_set(r, "serverInfo", info);
         char instr[600];
         snprintf(instr, sizeof(instr),
