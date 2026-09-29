@@ -859,13 +859,14 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
     DWORD start_ms = GetTickCount(); /* 每次调用独立计时（不能 static，否则第二次调用起全部误判超时） */
     int alive = 1;
     while (alive) {
-        /* 用 PeekNamedPipe 避免阻塞 */
+        /* 抽干管道：原来每轮只读一次 4096B，再等 50ms 进程句柄，所有命令的输出吞吐被钉死在 ~80KB/s，大输出命令（编译）6.7MB 要 100s+）被拖慢数十倍。 */
+        int got = 0;
         DWORD avail = 0;
-        if (PeekNamedPipe(hOutR, NULL, 0, NULL, &avail, NULL) && avail > 0) {
-            if (ReadFile(hOutR, buf, sizeof(buf), &rd, NULL) && rd > 0) {
-                out_append(&out, &olen, &ocap, buf, (int)rd, &truncated);
-                progress_scan(out, olen, &emitted, 0);
-            }
+        while (PeekNamedPipe(hOutR, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+            if (!ReadFile(hOutR, buf, sizeof(buf), &rd, NULL) || rd == 0) break;
+            out_append(&out, &olen, &ocap, buf, (int)rd, &truncated);
+            progress_scan(out, olen, &emitted, 0);
+            got = 1;
         }
         /* 客户端断开（progress 发送失败）→ 终止整树 */
         if (g_client_gone) {
@@ -880,7 +881,7 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
             alive = 0;
         }
         if (!alive) break;
-        DWORD wait = WaitForSingleObject(pi.hProcess, 50);
+        DWORD wait = WaitForSingleObject(pi.hProcess, got ? 0 : 50);
         if (wait != WAIT_TIMEOUT) {
             /* 读完剩余数据 */
             while (PeekNamedPipe(hOutR, NULL, 0, NULL, &avail, NULL) && avail > 0) {
@@ -1153,7 +1154,7 @@ static void handle_message(const char *line) {
         j_set(r, "capabilities", caps);
         Json *info = j_obj();
         j_set(info, "name", j_str("win-exec-mcp"));
-        j_set(info, "version", j_str("0.3.9"));
+        j_set(info, "version", j_str("0.3.10"));
         j_set(r, "serverInfo", info);
         char instr[600];
         snprintf(instr, sizeof(instr),
