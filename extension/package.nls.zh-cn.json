@@ -1,0 +1,17 @@
+{
+	"ext.description": "把 Remote-SSH（Linux 端）的 AI agent 桥接到 Windows 主机的 MCP 服务器：可从 Copilot / Claude Code 等直接运行 Windows 命令 / CLI / 脚本，并取回 stdout/stderr/退出码。支持 stdio + HTTP 两种模式，首次运行显式征得同意，不静默改配置。",
+	"cmd.startHttp.title": "WinExec MCP: 启动 HTTP 服务",
+	"cmd.stopHttp.title": "WinExec MCP: 停止 HTTP 服务",
+	"cmd.register.title": "WinExec MCP: 注册用户级 mcp.json",
+	"cmd.registerProject.title": "WinExec MCP: 注册到本项目 (.vscode/mcp.json)",
+	"cmd.unregisterProject.title": "WinExec MCP: 从本项目移除注册",
+	"cmd.setupExternal.title": "WinExec MCP: 配置服务器端 agent（SSH 转发 + 项目注册）",
+	"cmd.setup.title": "WinExec MCP: 启用 / 重新运行配置（需同意）",
+	"cmd.fixFirewall.title": "WinExec MCP: 修复防火墙权限（管理员）",
+	"config.stdio.enabled.description": "把内置 exe 以 stdio 模式注册到用户级 mcp.json（local 模式，Windows 客户端拉起，走 Remote-SSH 通道）。默认关闭；首次启用会先征得用户同意才写入 mcp.json",
+	"config.http.enabled.description": "HTTP 实例进程开关（仅远端窗口自动拉起）+ 自动连接（workbench.mcp.startServer '*'）。默认关闭；首次启用会先征得用户同意",
+	"config.http.port.description": "HTTP 监听端口",
+	"config.http.token.description": "HTTP Bearer token（留空则首次激活自动生成随机 token 并持久化）",
+	"config.http.host.description": "手动指定局域网 IP（多网卡/热点场景覆盖自动探测；留空则自动探测并跳过热点网段）",
+	"config.ssh.localPort.description": "服务器本机回环端口（RemoteForward 127.0.0.1:<localPort> → Windows 127.0.0.1:<http.port>）"
+}

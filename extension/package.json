@@ -1,8 +1,8 @@
 {
 	"name": "win-exec-mcp",
 	"displayName": "WinExec MCP for Remote-SSH",
-	"description": "MCP server bridging Remote-SSH (Linux) AI agents to the Windows host: run Windows commands/CLIs/scripts from Copilot, Claude Code, etc. and get stdout/stderr/exit code back. stdio + HTTP modes, explicit first-run consent, no silent config changes.",
-	"version": "0.3.11",
+	"description": "%ext.description%",
+	"version": "0.4.0",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/a563471014-sketch/remote-ssh-win-exec-mcp"
@@ -23,39 +23,40 @@
 		"onStartupFinished"
 	],
 	"main": "./extension.js",
+	"l10n": "./l10n",
 	"contributes": {
 		"commands": [
 			{
 				"command": "winExecMcp.startHttp",
-				"title": "WinExec MCP: Start HTTP service"
+				"title": "%cmd.startHttp.title%"
 			},
 			{
 				"command": "winExecMcp.stopHttp",
-				"title": "WinExec MCP: Stop HTTP service"
+				"title": "%cmd.stopHttp.title%"
 			},
 			{
 				"command": "winExecMcp.register",
-				"title": "WinExec MCP: Register user mcp.json"
+				"title": "%cmd.register.title%"
 			},
 			{
 				"command": "winExecMcp.registerProject",
-				"title": "WinExec MCP: 注册到本项目 (.vscode/mcp.json)"
+				"title": "%cmd.registerProject.title%"
 			},
 			{
 				"command": "winExecMcp.unregisterProject",
-				"title": "WinExec MCP: 从本项目移除注册"
+				"title": "%cmd.unregisterProject.title%"
 			},
 			{
 				"command": "winExecMcp.setupExternal",
-				"title": "WinExec MCP: 配置服务器端 agent（SSH 转发 + 项目注册）"
+				"title": "%cmd.setupExternal.title%"
 			},
 			{
 				"command": "winExecMcp.setup",
-				"title": "WinExec MCP: Enable / Re-run setup (consent)"
+				"title": "%cmd.setup.title%"
 			},
 			{
 				"command": "winExecMcp.fixFirewall",
-				"title": "WinExec MCP: 修复防火墙权限（管理员）"
+				"title": "%cmd.fixFirewall.title%"
 			}
 		],
 		"configuration": {
@@ -64,32 +65,32 @@
 				"winExecMcp.stdio.enabled": {
 					"type": "boolean",
 					"default": false,
-					"description": "把内置 exe 以 stdio 模式注册到用户级 mcp.json（local 模式，Windows 客户端拉起，走 Remote-SSH 通道）。默认关闭；首次启用会先征得用户同意才写入 mcp.json"
+					"description": "%config.stdio.enabled.description%"
 				},
 				"winExecMcp.http.enabled": {
 					"type": "boolean",
 					"default": false,
-					"description": "HTTP 实例进程开关（仅远端窗口自动拉起）+ 自动连接（workbench.mcp.startServer '*'）。默认关闭；首次启用会先征得用户同意"
+					"description": "%config.http.enabled.description%"
 				},
 				"winExecMcp.http.port": {
 					"type": "number",
 					"default": 38848,
-					"description": "HTTP 监听端口"
+					"description": "%config.http.port.description%"
 				},
 				"winExecMcp.http.token": {
 					"type": "string",
 					"default": "",
-					"description": "HTTP Bearer token（留空则首次激活自动生成随机 token 并持久化）"
+					"description": "%config.http.token.description%"
 				},
 				"winExecMcp.http.host": {
 					"type": "string",
 					"default": "",
-					"description": "手动指定局域网 IP（多网卡/热点场景覆盖自动探测；留空则自动探测并跳过热点网段）"
+					"description": "%config.http.host.description%"
 				},
 				"winExecMcp.ssh.localPort": {
 					"type": "number",
 					"default": 28848,
-					"description": "服务器本机回环端口（RemoteForward 127.0.0.1:<localPort> → Windows 127.0.0.1:<http.port>）"
+					"description": "%config.ssh.localPort.description%"
 				}
 			}
 		}

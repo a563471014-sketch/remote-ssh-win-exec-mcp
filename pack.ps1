@@ -1,4 +1,4 @@
-param([string]$Version = "0.3.11")
+param([string]$Version = "0.4.0")
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 

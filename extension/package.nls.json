@@ -1,0 +1,17 @@
+{
+	"ext.description": "MCP server bridging Remote-SSH (Linux) AI agents to the Windows host: run Windows commands/CLIs/scripts from Copilot, Claude Code, etc. and get stdout/stderr/exit code back. stdio + HTTP modes, explicit first-run consent, no silent config changes.",
+	"cmd.startHttp.title": "WinExec MCP: Start HTTP service",
+	"cmd.stopHttp.title": "WinExec MCP: Stop HTTP service",
+	"cmd.register.title": "WinExec MCP: Register user mcp.json",
+	"cmd.registerProject.title": "WinExec MCP: Register in this project (.vscode/mcp.json)",
+	"cmd.unregisterProject.title": "WinExec MCP: Remove from this project",
+	"cmd.setupExternal.title": "WinExec MCP: Configure server-side agent (SSH forwarding + project registration)",
+	"cmd.setup.title": "WinExec MCP: Enable / Re-run setup (consent)",
+	"cmd.fixFirewall.title": "WinExec MCP: Fix firewall permissions (administrator)",
+	"config.stdio.enabled.description": "Register the bundled exe in stdio mode into the user-level mcp.json (local mode, launched by the Windows client over the Remote-SSH channel). Off by default; the first enable asks for your consent before writing mcp.json",
+	"config.http.enabled.description": "HTTP instance process switch (only auto-started in remote windows) + auto connect (workbench.mcp.startServer '*'). Off by default; the first enable asks for your consent",
+	"config.http.port.description": "HTTP listening port",
+	"config.http.token.description": "HTTP Bearer token (leave empty to auto-generate a random token on first activation and persist it)",
+	"config.http.host.description": "Manually specify a LAN IP (overrides auto-detection for multi-NIC / hotspot setups; leave empty to auto-detect and skip hotspot subnets)",
+	"config.ssh.localPort.description": "Server-side loopback port (RemoteForward 127.0.0.1:<localPort> → Windows 127.0.0.1:<http.port>)"
+}

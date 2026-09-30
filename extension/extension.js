@@ -35,10 +35,11 @@ function noteRepaired(what) {
     logMsg('repaired:', what);
     if (repairTimer) clearTimeout(repairTimer);
     repairTimer = setTimeout(() => {
-        const list = Array.from(repairedItems).join('、');
+        const list = Array.from(repairedItems).join(vscode.l10n.t(', '));
         repairedItems.clear();
-        vscode.window.showInformationMessage('WinExec MCP: 已修复配置文件（' + list + '），需重载窗口生效', '重载窗口')
-            .then((pick) => { if (pick === '重载窗口') vscode.commands.executeCommand('workbench.action.reloadWindow'); });
+        const reloadLabel = vscode.l10n.t('Reload Window');
+        vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('Repaired configuration files ({0}); reload the window to apply', list), reloadLabel)
+            .then((pick) => { if (pick === reloadLabel) vscode.commands.executeCommand('workbench.action.reloadWindow'); });
     }, 2000);
 }
 
@@ -147,7 +148,7 @@ function ensureUserMcp(context, cfg) {
         raw = fs.readFileSync(p, 'utf8');
     } catch (e) {
         if (!e || e.code !== 'ENOENT') {
-            vscode.window.showErrorMessage('WinExec MCP: 用户级 mcp.json 读取失败：' + p);
+            vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('failed to read the user-level mcp.json: {0}', p));
             return;
         }
     }
@@ -155,7 +156,7 @@ function ensureUserMcp(context, cfg) {
     try {
         doc = raw.trim() ? JSON.parse(raw) : {};
     } catch (e) {
-        vscode.window.showErrorMessage('WinExec MCP: 用户级 mcp.json 解析失败（可能含注释），请手动配置：' + p);
+        vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('failed to parse the user-level mcp.json (it may contain comments), please configure it manually: {0}', p));
         return;
     }
     if (!doc.servers && !doc.mcpServers) {
@@ -191,7 +192,7 @@ function ensureUserMcp(context, cfg) {
     }
     if (!changed) return;
     fs.writeFileSync(p, JSON.stringify(doc, null, '\t'));
-    vscode.window.showInformationMessage('WinExec MCP: 用户级 mcp.json 已更新，Reload Window 后生效', 'Reload Window')
+    vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('user-level mcp.json updated, takes effect after reloading the window'), vscode.l10n.t('Reload Window'))
         .then((pick) => { if (pick) vscode.commands.executeCommand('workbench.action.reloadWindow'); });
 }
 
@@ -315,7 +316,7 @@ function sameHttpEntry(a, b) {
 
 async function registerProject() {
     const paths = workspaceMcpPaths();
-    if (!paths) { vscode.window.showErrorMessage('WinExec MCP: 当前没有打开的工作区'); return; }
+    if (!paths) { vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('no workspace is open')); return; }
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     const entry = projectHttpEntry(cfg);
     const mEntry = { type: 'http', url: entry.url, headers: entry.headers };
@@ -329,7 +330,7 @@ async function registerProject() {
         if (text) doc = JSON.parse(text);
     } catch (e) {
         if (e && e.code !== 'FileNotFound') {
-            vscode.window.showErrorMessage('WinExec MCP: ' + paths.file.fsPath + ' 解析失败（可能含注释），请手动添加：\n' + JSON.stringify({ [HTTP_ID]: entry }, null, 2));
+            vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('failed to parse {0} (it may contain comments), please add manually:\n{1}', paths.file.fsPath, JSON.stringify({ [HTTP_ID]: entry }, null, 2)));
             return;
         }
     }
@@ -350,7 +351,7 @@ async function registerProject() {
         if (text) mdoc = JSON.parse(text);
     } catch (e) {
         if (e && e.code !== 'FileNotFound') {
-            vscode.window.showErrorMessage('WinExec MCP: ' + rootFile.fsPath + ' 解析失败（可能含注释），请手动添加');
+            vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('failed to parse {0} (it may contain comments), please add manually', rootFile.fsPath));
             return;
         }
     }
@@ -362,7 +363,7 @@ async function registerProject() {
     }
 
     if (changed) {
-        noteRepaired('项目注册（.vscode/mcp.json + .mcp.json）');
+        noteRepaired(vscode.l10n.t('project registration (.vscode/mcp.json + .mcp.json)'));
         setTimeout(autoStartHttpConnection, 3000);
     }
 }
@@ -396,7 +397,7 @@ async function unregisterProject() {
             }
         }
     } catch (e) { }
-    vscode.window.showInformationMessage(removed ? 'WinExec MCP: 已从本项目移除注册' : 'WinExec MCP: 本项目未找到注册记录');
+    vscode.window.showInformationMessage('WinExec MCP: ' + (removed ? vscode.l10n.t('removed from this project') : vscode.l10n.t('no registration found in this project')));
 }
 
 function isPortListening(port) {
@@ -433,14 +434,14 @@ function startHttp(context) {
         if (Date.now() < httpNextTryAt) return;
         const exe = serviceExe(context);
         if (!fs.existsSync(exe)) {
-            vscode.window.showErrorMessage('WinExec MCP: 内置 exe 缺失 ' + exe);
+            vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('bundled exe is missing {0}', exe));
             return;
         }
         const args = ['--http', String(port), '--token', currentToken(cfg), '--parent-pid', String(process.pid)];
         const bindHost = cfg.get('http.host', '');
         if (bindHost) args.push('--bind', bindHost); // 默认 exe 只绑 127.0.0.1；显式配置局域网 IP 时才绑它
         child = spawn(exe, args, { windowsHide: true, stdio: 'ignore' });
-        child.on('error', (err) => vscode.window.showErrorMessage('WinExec MCP 启动失败: ' + err.message));
+        child.on('error', (err) => vscode.window.showErrorMessage(vscode.l10n.t('WinExec MCP failed to start: {0}', err.message)));
         child.on('exit', () => { child = null; });
         // 3 秒后复查：ok=正常；refused=进程没起来（退避重试）；timeout=回环被拦截（提示一键修复）
         setTimeout(() => {
@@ -451,7 +452,7 @@ function startHttp(context) {
                 httpNextTryAt = Date.now() + Math.min(15000 * Math.pow(2, Math.min(httpSpawnFails - 1, 3)), 120000);
                 logMsg('startHttp: port ' + port + ' probe=' + r + ' after spawn (fail #' + httpSpawnFails + '), backoff');
                 if (httpSpawnFails === 5 && r !== 'timeout') {
-                    vscode.window.showWarningMessage('WinExec MCP: HTTP 服务多次启动后仍不可连（端口 ' + port + '），已放慢重试；详见“输出 → WinExec MCP”');
+                    vscode.window.showWarningMessage('WinExec MCP: ' + vscode.l10n.t('the HTTP service still cannot be reached after several attempts (port {0}); retries have been slowed down - see Output → WinExec MCP', String(port)));
                 }
             });
         }, 3000);
@@ -468,12 +469,14 @@ function noteFirewallBlocked(context, port) {
     if (blockedWarned) return;
     blockedWarned = true;
     logMsg('probe timeout on 127.0.0.1:' + port + ' - likely blocked by firewall / security suite');
+    const fixLabel = vscode.l10n.t('Run repair (administrator)');
+    const outputLabel = vscode.l10n.t('Open Output');
     vscode.window.showWarningMessage(
-        'WinExec MCP: 服务端口 ' + port + ' 连接超时——本机防火墙/安全软件拦截了 win-exec-mcp（连本机回环都被丢包）。可运行一键修复。',
-        '运行修复（需管理员）', '打开输出'
+        'WinExec MCP: ' + vscode.l10n.t('connection to port {0} times out - the local firewall / security software is blocking win-exec-mcp (even loopback packets are dropped). A one-click repair is available.', String(port)),
+        fixLabel, outputLabel
     ).then((pick) => {
-        if (pick === '运行修复（需管理员）') runFirewallFix(context);
-        else if (pick === '打开输出' && outChannel) outChannel.show();
+        if (pick === fixLabel) runFirewallFix(context);
+        else if (pick === outputLabel && outChannel) outChannel.show();
     });
 }
 
@@ -481,18 +484,19 @@ function noteFirewallBlocked(context, port) {
 function runFirewallFix(context) {
     const script = path.join(context.extensionPath, 'fix-firewall.ps1');
     if (!fs.existsSync(script)) {
-        vscode.window.showErrorMessage('WinExec MCP: 修复脚本缺失 ' + script);
+        vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('repair script is missing {0}', script));
         return;
     }
     const psArg = '-NoProfile -ExecutionPolicy Bypass -File "' + script.replace(/"/g, '""') + '"';
     const psCmd = "Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList '" + psArg.replace(/'/g, "''") + "'";
     try {
         const p = spawn('powershell.exe', ['-NoProfile', '-Command', psCmd], { windowsHide: true, stdio: 'ignore' });
-        p.on('error', (err) => vscode.window.showErrorMessage('WinExec MCP: 无法启动修复脚本: ' + err.message));
-        vscode.window.showInformationMessage('WinExec MCP: 正在请求管理员权限运行修复（请在 UAC 弹窗点“是”）；完成后重载窗口生效', '重载窗口')
-            .then((pick) => { if (pick === '重载窗口') vscode.commands.executeCommand('workbench.action.reloadWindow'); });
+        p.on('error', (err) => vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('cannot start the repair script: {0}', err.message)));
+        const reloadLabel = vscode.l10n.t('Reload Window');
+        vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('requesting administrator privileges to run the repair (click Yes in the UAC dialog); reload the window afterwards'), reloadLabel)
+            .then((pick) => { if (pick === reloadLabel) vscode.commands.executeCommand('workbench.action.reloadWindow'); });
     } catch (e) {
-        vscode.window.showErrorMessage('WinExec MCP: 无法启动修复脚本: ' + e.message);
+        vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('cannot start the repair script: {0}', e.message));
     }
 }
 
@@ -519,20 +523,19 @@ async function enableExternalSetup(context) {
     }
     // 开关变化触发 onDidChangeConfiguration → autoSetup：远端窗口随即追加 RemoteForward 并注册项目文件
     if (!vscode.env.remoteName) {
-        vscode.window.showInformationMessage('WinExec MCP: 已开启服务器端 agent 配置（HTTP 服务 + SSH 回环转发 + 项目注册），Remote-SSH 窗口打开时自动生效');
+        vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('server-side agent configuration enabled (HTTP service + SSH loopback forwarding + project registration); it takes effect automatically when a Remote-SSH window opens'));
     }
 }
 
 // 首次运行征得同意：明确列出将修改的文件；“完整配置”额外覆盖服务器端 agent 链路
-const CONSENT_FULL = '完整配置（含服务器端 agent）';
-const CONSENT_BASIC = '仅 VS Code';
+// 标签在加载时按当前显示语言取值，且同一语言内比较（用户选择即返回同一字符串）
+const CONSENT_FULL = vscode.l10n.t('Full setup (incl. server-side agent)');
+const CONSENT_BASIC = vscode.l10n.t('VS Code only');
 
 async function askConsent(context) {
     const pick = await vscode.window.showWarningMessage(
-        'WinExec MCP 需要你的同意才会修改配置，请选择范围：\n' +
-        '· ' + CONSENT_FULL + '：注册用户级 mcp.json（stdio）；Remote-SSH 窗口自动启动本机 HTTP 服务并连接；追加 ~/.ssh/config（独立 Host 块，原文件先备份）；向当前项目写入 .vscode/mcp.json 和 .mcp.json（含 Bearer token）——服务器端 Claude Code / Cursor 等经 SSH 回环直连\n' +
-        '· ' + CONSENT_BASIC + '：只做前两项，VS Code 内建 agent 即可使用；外部 agent 之后可随时用命令 “WinExec MCP: 配置服务器端 agent” 一键补齐',
-        { modal: true }, CONSENT_FULL, CONSENT_BASIC, '暂不');
+        vscode.l10n.t('WinExec MCP needs your consent before changing any configuration. Choose the scope:\n· {0}: register the user-level mcp.json (stdio); Remote-SSH windows start and connect to the local HTTP service automatically; append to ~/.ssh/config (a separate Host block, the original file is backed up first); write .vscode/mcp.json and .mcp.json into the current project (with the Bearer token) - server-side Claude Code / Cursor etc. connect back through the SSH loopback\n· {1}: only the first two items, enough for the built-in VS Code agent; the external agent can be added later at any time with the command \'WinExec MCP: Configure server-side agent\'', CONSENT_FULL, CONSENT_BASIC),
+        { modal: true }, CONSENT_FULL, CONSENT_BASIC, vscode.l10n.t('Not now'));
     if (pick !== CONSENT_FULL && pick !== CONSENT_BASIC) {
         await context.globalState.update(CONSENT_KEY, false);
         return false;
@@ -602,14 +605,15 @@ async function externalSetupSweep(context) {
     if (!consentGranted) {
         if (!wantSsh && !wantProject) return;
         const hasFolder = !!(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length);
+        const enableLabel = vscode.l10n.t('Enable');
+        const notNowLabel = vscode.l10n.t('Not now');
         const pick = await vscode.window.showWarningMessage(
-            'WinExec MCP: 服务器端 agent（Claude Code / Cursor 等）配置未启用（SSH 回环转发 / 项目注册），需要授权' +
-            (hasFolder ? '' : '。当前未打开项目，项目注册会在打开后自动完成') +
-            '。授权后每次启动自动检查并修复，修复后提示重载生效',
-            '启用', '暂不');
-        if (pick === '启用') {
+            'WinExec MCP: ' + vscode.l10n.t('server-side agent (Claude Code / Cursor, etc.) configuration is not enabled (SSH loopback forwarding / project registration) and needs your consent{0}. Once authorized it is checked and repaired automatically on every start, and a reload prompt is shown afterwards',
+                hasFolder ? '' : vscode.l10n.t('. No project is open yet; project registration completes automatically once a project is opened')),
+            enableLabel, notNowLabel);
+        if (pick === enableLabel) {
             await enableExternalSetup(context);
-        } else if (pick === '暂不') {
+        } else if (pick === notNowLabel) {
             await context.globalState.update(EXTERNAL_OPTOUT_KEY, { ssh: true, project: true });
         }
         return;
@@ -620,8 +624,8 @@ async function externalSetupSweep(context) {
         if (sshForwardStatus(cfg) !== 'ok') {
             ensureSshForward(context); // 缺失则补写；conflict 时不碰（下面报告）
             const s = sshForwardStatus(cfg);
-            if (s === 'conflict') problems.push('~/.ssh/config 同一入口端口已有其它 RemoteForward，需手动调整');
-            else if (s !== 'ok' && sshHost()) problems.push('无法写入 ~/.ssh/config（检查文件权限）');
+            if (s === 'conflict') problems.push(vscode.l10n.t('~/.ssh/config already has another RemoteForward on the same entry port; adjust it manually'));
+            else if (s !== 'ok' && sshHost()) problems.push(vscode.l10n.t('cannot write ~/.ssh/config (check file permissions)'));
         }
     }
     if (wantProject) {
@@ -630,13 +634,13 @@ async function externalSetupSweep(context) {
             try { await registerProject(); } catch (e) { }
             st = await projectFilesStatus(cfg);
         }
-        const stName = { missing: '条目缺失', wrong: '条目过期' };
-        if (st === 'broken') problems.push('项目 mcp 文件解析失败（可能含注释），需手动处理');
-        else if (st !== 'ok' && st !== 'na') problems.push('无法写入项目 mcp 文件（' + (stName[st] || st) + '）');
+        const stName = { missing: vscode.l10n.t('item missing'), wrong: vscode.l10n.t('item outdated') };
+        if (st === 'broken') problems.push(vscode.l10n.t('project mcp file failed to parse (it may contain comments); manual fix required'));
+        else if (st !== 'ok' && st !== 'na') problems.push(vscode.l10n.t('cannot write the project mcp file ({0})', stName[st] || st));
     }
     if (problems.length) {
-        logMsg('sweep problems: ' + problems.join('；'));
-        vscode.window.showWarningMessage('WinExec MCP: ' + problems.join('；'));
+        logMsg('sweep problems: ' + problems.join(vscode.l10n.t('; ')));
+        vscode.window.showWarningMessage('WinExec MCP: ' + problems.join(vscode.l10n.t('; ')));
     } else {
         logMsg('sweep: ok');
     }
