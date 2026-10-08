@@ -882,27 +882,32 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
     if (!CreatePipe(&hOutR, &hOutW, &sa, 0)) { rr.spawn_err = 1; return rr; }
     SetHandleInformation(hOutR, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si = { 0 };
+    STARTUPINFOW si = { 0 };
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hOutW;
     si.hStdError = hOutW;
     PROCESS_INFORMATION pi = { 0 };
 
-    /* 合并 stderr 到 stdout；完整命令行由调用方构造（cmd /c 或 git-bash 两条路径）。
-       CreateProcess 可能修改命令行缓冲，这里持有可变副本。 */
-    char *cmdline = _strdup(cmd_line_in);
+    /* 命令行是 UTF-8，必须走 W 版 API：CreateProcessA 会把该字节串按 CP_ACP 解码，
+       中文等非 ASCII 参数被错位重编码（git-bash 侧直接乱码，cmd 侧仅因 GBK 往返
+       恰好还原而看似正常）。CreateProcessW 可能修改命令行缓冲，这里持有可写副本。 */
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd_line_in, -1, NULL, 0);
+    wchar_t *wcmdline = (wchar_t *)malloc((wlen > 0 ? wlen : 1) * sizeof(wchar_t));
+    if (wlen > 0) MultiByteToWideChar(CP_UTF8, 0, cmd_line_in, -1, wcmdline, wlen);
+    else wcmdline[0] = 0;
     /* UNC cwd 自我修复：win-exec 当前目录若是 UNC（\\\\ 开头），cmd 继承会报
        "UNC 路径不受支持"；此时用系统盘符作子进程 cwd（不依赖任何盘映射）。 */
-    char safe_cwd[MAX_PATH] = "";
-    if (GetCurrentDirectoryA(MAX_PATH, safe_cwd) && safe_cwd[0] == '\\' && safe_cwd[1] == '\\') {
-        GetWindowsDirectoryA(safe_cwd, MAX_PATH);
-        for (char *p = safe_cwd; *p; p++) if (*p == '\\') { *p = 0; break; }
+    wchar_t safe_cwd[MAX_PATH] = L"";
+    wchar_t cwd_now[MAX_PATH] = L"";
+    if (GetCurrentDirectoryW(MAX_PATH, cwd_now) && cwd_now[0] == L'\\' && cwd_now[1] == L'\\') {
+        GetWindowsDirectoryW(safe_cwd, MAX_PATH);
+        for (wchar_t *p = safe_cwd; *p; p++) if (*p == L'\\') { *p = 0; break; }
     }
-    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+    BOOL ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW, NULL,
                              safe_cwd[0] ? safe_cwd : NULL, &si, &pi);
-    free(cmdline);
+    free(wcmdline);
     CloseHandle(hOutW);
 
     if (!ok) { rr.spawn_err = 1; CloseHandle(hOutR); return rr; }
