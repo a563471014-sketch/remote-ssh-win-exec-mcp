@@ -1226,7 +1226,7 @@ static void handle_message(const char *line) {
         j_set(r, "capabilities", caps);
         Json *info = j_obj();
         j_set(info, "name", j_str("win-exec-mcp"));
-        j_set(info, "version", j_str("0.4.0"));
+        j_set(info, "version", j_str("0.4.1"));
         j_set(r, "serverInfo", info);
         char instr[600];
         snprintf(instr, sizeof(instr),

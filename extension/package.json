@@ -2,7 +2,7 @@
 	"name": "win-exec-mcp",
 	"displayName": "WinExec MCP for Remote-SSH",
 	"description": "%ext.description%",
-	"version": "0.4.0",
+	"version": "0.4.1",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/a563471014-sketch/remote-ssh-win-exec-mcp"
