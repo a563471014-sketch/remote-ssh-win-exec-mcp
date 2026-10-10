@@ -9,6 +9,13 @@
  *
  * 传输：MCP stdio —— newline-delimited JSON，同时兼容 Content-Length 帧。
  */
+
+/* 版本号由构建脚本注入（build.cmd 传 -DWINEXEC_VERSION=\"x.y.z\"）；手工编译时退化为 dev。
+ * serverInfo.version 原样上报它——这是远端判断“实际在跑哪一版”的唯一途径。 */
+#ifndef WINEXEC_VERSION
+#define WINEXEC_VERSION "dev"
+#endif
+
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601 /* Job Object / RegGetValue 等 API 可用性 */
 #include <winsock2.h>
@@ -887,6 +894,23 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hOutW;
     si.hStdError = hOutW;
+    /* 句柄白名单（Vista+）：只把管道写端交给子进程，而不是"所有可继承句柄"。
+       防止将来任何新增的可继承句柄（如监听 socket）再次泄漏进子进程。 */
+    HANDLE inherit_list[1] = { hOutW };
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+    BOOL have_attrs = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size);
+    if (have_attrs) {
+        have_attrs = UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                               inherit_list, sizeof(inherit_list), NULL, NULL);
+    }
+    STARTUPINFOEXW six = { 0 };
+    six.StartupInfo.cb = sizeof(six);
+    six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    six.StartupInfo.hStdOutput = hOutW;
+    six.StartupInfo.hStdError = hOutW;
+    six.lpAttributeList = have_attrs ? attrs : NULL;
     PROCESS_INFORMATION pi = { 0 };
 
     /* 命令行是 UTF-8，必须走 W 版 API：CreateProcessA 会把该字节串按 CP_ACP 解码，
@@ -904,9 +928,11 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
         GetWindowsDirectoryW(safe_cwd, MAX_PATH);
         for (wchar_t *p = safe_cwd; *p; p++) if (*p == L'\\') { *p = 0; break; }
     }
-    BOOL ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW, NULL,
-                             safe_cwd[0] ? safe_cwd : NULL, &si, &pi);
+    BOOL ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE, /* 白名单模式下仍须 TRUE */
+                             CREATE_NO_WINDOW | (have_attrs ? EXTENDED_STARTUPINFO_PRESENT : 0),
+                             NULL, safe_cwd[0] ? safe_cwd : NULL,
+                             have_attrs ? &six.StartupInfo : &si, &pi);
+    if (attrs) { if (have_attrs) DeleteProcThreadAttributeList(attrs); free(attrs); }
     free(wcmdline);
     CloseHandle(hOutW);
 
@@ -1226,7 +1252,7 @@ static void handle_message(const char *line) {
         j_set(r, "capabilities", caps);
         Json *info = j_obj();
         j_set(info, "name", j_str("win-exec-mcp"));
-        j_set(info, "version", j_str("0.4.1"));
+        j_set(info, "version", j_str(WINEXEC_VERSION));
         j_set(r, "serverInfo", info);
         char instr[600];
         snprintf(instr, sizeof(instr),
@@ -1580,14 +1606,30 @@ static DWORD g_parent_pid = 0;
 
 /* 父进程看护：--parent-pid 指定的进程（扩展 host）退出后本服务自动退出，
    避免 VS Code 关闭/卸载/崩溃后留下占用端口的孤儿进程 */
+/* 监听 socket 提为全局：任何退出路径都要先关它，端口才能立刻释放 */
+static SOCKET g_listen_socket = INVALID_SOCKET;
+static volatile LONG g_stop_requested = 0;
+
+/* 请求停止：先关监听 socket（立即释放端口 + 唤醒阻塞中的 accept），主循环随后正常退出。
+   不用 ExitProcess 硬退，避免跳过清理、也让端口尽早可用。 */
+static void http_request_stop(void) {
+    InterlockedExchange(&g_stop_requested, 1);
+    SOCKET s = g_listen_socket;
+    if (s != INVALID_SOCKET) {
+        g_listen_socket = INVALID_SOCKET;
+        shutdown(s, SD_BOTH);
+        closesocket(s);
+    }
+}
+
 static DWORD WINAPI parent_watchdog(LPVOID arg) {
     (void)arg;
     HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, g_parent_pid);
-    if (!h) ExitProcess(1); /* 父进程已不存在，无需看护 */
+    if (!h) { http_request_stop(); return 0; } /* 父进程已不存在，无需看护 */
     for (;;) {
         DWORD w = WaitForSingleObject(h, 2000);
-        if (w == WAIT_OBJECT_0) { CloseHandle(h); ExitProcess(0); } /* 父进程已退出 */
-        if (w == WAIT_FAILED) { CloseHandle(h); ExitProcess(1); }
+        if (w == WAIT_OBJECT_0) { CloseHandle(h); http_request_stop(); return 0; } /* 父进程已退出 */
+        if (w == WAIT_FAILED) { CloseHandle(h); http_request_stop(); return 0; }
     }
     return 0;
 }
@@ -1603,6 +1645,10 @@ static int http_main(int port, const char *token, DWORD parent_pid, const char *
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "WSAStartup failed\n"); return 1; }
     SOCKET ls = socket(AF_INET, SOCK_STREAM, 0);
     if (ls == INVALID_SOCKET) { fprintf(stderr, "socket failed\n"); return 1; }
+    /* socket 默认【可继承】：若不禁止，run_cmdline() 用 bInheritHandles=TRUE 创建子进程时
+       会把监听 socket 一并交给子进程 -> 本进程退出后 socket 不销毁，端口被孤儿子进程占住；
+       在 SO_EXCLUSIVEADDRUSE 下这意味着该端口永久无法再 bind。 */
+    SetHandleInformation((HANDLE)ls, HANDLE_FLAG_INHERIT, 0);
     int one = 1;
     /* Windows 独占绑定：同端口第二个实例 bind 直接失败退出，避免多实例共享端口收不到连接 */
 #ifdef SO_EXCLUSIVEADDRUSE
@@ -1617,14 +1663,34 @@ static int http_main(int port, const char *token, DWORD parent_pid, const char *
     addr.sin_addr.s_addr = (bind_addr && *bind_addr) ? inet_addr(bind_addr) : htonl(0x7f000001); /* 127.0.0.1 */
     addr.sin_port = htons((unsigned short)port);
     if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        fprintf(stderr, "bind %s:%d failed (error %d)\n", (bind_addr && *bind_addr) ? bind_addr : "127.0.0.1", port, WSAGetLastError());
+        int err = WSAGetLastError();
+        const char *host = (bind_addr && *bind_addr) ? bind_addr : "127.0.0.1";
+        if (err == WSAEADDRINUSE) {
+            SOCKET pr = socket(AF_INET, SOCK_STREAM, 0);
+            int still_alive = (pr != INVALID_SOCKET &&
+                               connect(pr, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+            if (pr != INVALID_SOCKET) closesocket(pr);
+            fprintf(stderr,
+                    "bind %s:%d failed: WSAEADDRINUSE (%s)\n"
+                    "  %s\n", host, port,
+                    still_alive ? "port still accepting connections" : "port not responding (stale)",
+                    still_alive ? "  -> another instance is running; if not, end leftover win-exec-mcp.exe and retry"
+                                : "  -> likely an orphan socket (listen handle inherited by a child process); end leftovers or use another port");
+        } else {
+            fprintf(stderr, "bind %s:%d failed (WSA error %d)\n", host, port, err);
+        }
+        closesocket(ls);
         return 1;
     }
-    if (listen(ls, 16) != 0) { fprintf(stderr, "listen failed\n"); return 1; }
+    if (listen(ls, 16) != 0) { fprintf(stderr, "listen failed\n"); closesocket(ls); return 1; }
+    g_listen_socket = ls; /* 交给退出路径清理 */
     fprintf(stderr, "win-exec-mcp HTTP listening on %s:%d (token: %s)\n", (bind_addr && *bind_addr) ? bind_addr : "127.0.0.1", port, g_token ? "set" : "none");
     for (;;) {
         SOCKET cl = accept(ls, NULL, NULL);
-        if (cl == INVALID_SOCKET) continue;
+        if (cl == INVALID_SOCKET) {
+            if (InterlockedCompareExchange(&g_stop_requested, 0, 0)) break; /* 收到停止请求 */
+            continue;
+        }
         CreateThread(NULL, 0, http_client_thread, (LPVOID)(intptr_t)cl, 0, NULL);
     }
     WSACleanup();
