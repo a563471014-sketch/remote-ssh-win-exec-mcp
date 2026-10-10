@@ -12,3 +12,5 @@ node_modules/
 
 # os
 Thumbs.db
+# agent/editor backups
+*.bak-*

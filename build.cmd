@@ -3,7 +3,10 @@ rem WinExec MCP pack: compile C -> refresh bundled files -> build vsix
 rem NOTE: bump VER together with extension\package.json version
 setlocal
 cd /d "%~dp0"
-set VER=0.4.1
+set VER=0.4.3
+rem 校验与 extension\package.json 一致（漏改会打出文件名/版本号错位的包）
+for /f %%v in ('powershell -NoProfile -Command "(Get-Content extension\package.json -Raw | ConvertFrom-Json).version"') do set PKGVER=%%v
+if not "%PKGVER%"=="%VER%" (echo [ERROR] VER=%VER% but extension\package.json=%PKGVER% & exit /b 1)
 
 rem ---- locate mingw gcc (first arg overrides; else PATH; else common installs) ----
 set GCC=%1
@@ -20,13 +23,17 @@ if "%GCC%"=="" (
 echo using GCC: %GCC%
 
 if not exist bin mkdir bin
-"%GCC%" -O2 -static -Wall -o bin\win-exec-mcp.exe win-exec-mcp.c -lws2_32
+"%GCC%" -O2 -static -Wall -DWINEXEC_VERSION=\"%VER%\" -o bin\win-exec-mcp.exe win-exec-mcp.c -lws2_32
 if errorlevel 1 (echo compile failed & exit /b 1)
 
 if not exist extension\bin mkdir extension\bin
 if not exist extension\src mkdir extension\src
 copy /Y bin\win-exec-mcp.exe extension\bin\ >nul
 copy /Y win-exec-mcp.c extension\src\ >nul
+rem also refresh the copy the extension actually loads at runtime (LOCALAPPDATA)
+rem A running instance locks this copy; a skipped copy is expected here
+rem (the extension re-syncs it automatically on the next activation).
+if exist "%LOCALAPPDATA%\win-exec-mcp\bin" (copy /Y bin\win-exec-mcp.exe "%LOCALAPPDATA%\win-exec-mcp\bin\" >nul 2>&1 || echo   [info] LOCALAPPDATA copy skipped - a running instance holds the file; it syncs on next activation)
 
 if not exist dist mkdir dist
 powershell -NoProfile -ExecutionPolicy Bypass -File pack.ps1 -Version %VER%
