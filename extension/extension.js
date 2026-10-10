@@ -420,15 +420,111 @@ function probePort(port, timeoutMs) {
     });
 }
 
+// 端口上跑的到底是不是一个"活的 HTTP 服务"：TCP 连上但迟迟没有响应，就是孤儿/僵尸监听
+// （句柄被子进程继承后父进程被杀，端口仍 LISTENING 但无人 accept 应答——探测必须做到 HTTP 层）
+// live=有 HTTP 响应；dead=连上但无响应（孤儿）；refused=无人监听
+function probeOurHttp(port, timeoutMs) {
+    return new Promise((resolve) => {
+        const s = net.connect(port, '127.0.0.1');
+        let buf = '';
+        let done = false;
+        const finish = (r) => { if (!done) { done = true; try { s.destroy(); } catch (e) { } resolve(r); } };
+        s.setTimeout(timeoutMs || 2000, () => finish(buf ? 'live' : 'dead'));
+        s.on('error', () => finish('refused'));
+        s.on('connect', () => {
+            try { s.write('GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n'); } catch (e) { finish('dead'); }
+        });
+        s.on('data', (d) => { buf += d; if (/^HTTP\/1\.[01] /.test(buf)) finish('live'); });
+        s.on('close', () => finish(buf ? 'live' : 'dead'));
+    });
+}
+
 let httpSpawnFails = 0;   // 连续启动失败次数（退避用，避免 watchdog 反复堆进程）
 let httpNextTryAt = 0;    // 退避期内不允许再次启动的时间戳
 let blockedWarned = false; // “回环被拦截”的告警只提示一次（连接成功后复位）
+let healingPort = false;  // 端口自愈进行中（防止 watchdog 与 probe 回调反复叠加进程）
+
+// 把指向旧端口的 RemoteForward 行改写到新端口：只动我们写过的形态（入口端口不变、目标端口为旧值），
+// 不新加 Host 块，避免每换一次端口就堆积一段
+function rewriteSshForwardPort(oldPort, newPort) {
+    if (!isSshRemote()) return false;
+    const cfg = vscode.workspace.getConfiguration('winExecMcp');
+    const localPort = cfg.get('ssh.localPort', 28848);
+    const sshConfig = path.join(os.homedir(), '.ssh', 'config');
+    let content;
+    try { content = fs.readFileSync(sshConfig, 'utf8'); } catch (e) { return false; }
+    const re = new RegExp('^(\\s*RemoteForward\\s+(?:127\\.0\\.0\\.1:)?' + localPort + '\\s+(?:127\\.0\\.0\\.1|localhost):)' + oldPort + '(\\s*(?:#.*)?)$', 'm');
+    if (!re.test(content)) return false;
+    try {
+        try { fs.copyFileSync(sshConfig, sshConfig + '.bak-winexec'); } catch (e) { }
+        fs.writeFileSync(sshConfig, content.replace(re, '$1' + newPort + '$2'));
+        noteRepaired('SSH RemoteForward 127.0.0.1:' + localPort + ' \u2192 127.0.0.1:' + newPort);
+        return true;
+    } catch (e) {
+        logMsg('rewriteSshForwardPort failed: ' + e.message);
+        return false;
+    }
+}
+
+// 端口连续起不来（被别人占用，或旧实例的残留监听占着）时自愈：换一个空闲端口重启服务，
+// 同步改设置与 ~/.ssh/config，再由 sweep 幂等同步项目文件。
+// 不做这一步的话，端口一旦被占就永远 bind 不上（SO_EXCLUSIVEADDRUSE），只剩无限退避。
+async function trySelfHealPort(context, fromPort) {
+    if (healingPort) return;
+    const cfg = vscode.workspace.getConfiguration('winExecMcp');
+    // 显式指定了绑定地址（局域网直连）时端口是用户选定的，不擅自换
+    if (cfg.get('http.host', '')) return;
+    healingPort = true;
+    try {
+        const exe = serviceExe(context);
+        if (!fs.existsSync(exe)) return;
+        logMsg('self-heal: port ' + fromPort + ' unusable, looking for a free port');
+        if (child) { try { child.kill(); } catch (e) { } child = null; }
+        const token = currentToken(cfg);
+        for (let p = fromPort + 1; p <= fromPort + 10; p++) {
+            if (await isPortListening(p)) continue;
+            const c = spawn(exe, ['--http', String(p), '--token', token, '--parent-pid', String(process.pid)],
+                { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+            if (c.stdout) c.stdout.on('data', (d) => logMsg('http[out] ' + String(d).replace(/[\r\n]+$/, '')));
+            if (c.stderr) c.stderr.on('data', (d) => logMsg('http[err] ' + String(d).replace(/[\r\n]+$/, '')));
+            await new Promise((r) => setTimeout(r, 1200));
+            if (await probePort(p, 1500) === 'ok') {
+                logMsg('self-heal: switched to port ' + p);
+                await cfg.update('http.port', p, vscode.ConfigurationTarget.Global);
+                rewriteSshForwardPort(fromPort, p);
+                child = c;
+                httpSpawnFails = 0; httpNextTryAt = 0; blockedWarned = false;
+                try { await externalSetupSweep(context); } catch (e) { logMsg('self-heal sweep failed: ' + e.message); }
+                const reload = vscode.l10n.t('Reload Window');
+                vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('port {0} is unusable (occupied by another program); switched to {1} and updated the configuration. Reload the window to apply.', String(fromPort), String(p)), reload)
+                    .then((pick) => { if (pick === reload) vscode.commands.executeCommand('workbench.action.reloadWindow'); });
+                return;
+            }
+            try { c.kill(); } catch (e) { }
+        }
+        logMsg('self-heal: no usable port in ' + (fromPort + 1) + '..' + (fromPort + 10));
+        vscode.window.showWarningMessage('WinExec MCP: ' + vscode.l10n.t('port {0} is unusable and no alternative port worked - see Output \u2192 WinExec MCP', String(fromPort)));
+    } finally {
+        healingPort = false;
+    }
+}
 
 function startHttp(context) {
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     const port = cfg.get('http.port', 38848);
     return isPortListening(port).then((listening) => {
-        if (listening) { httpSpawnFails = 0; httpNextTryAt = 0; return; }
+        if (listening) {
+            // 端口有监听不等于我们的服务在跑（可能是别的程序占了这个端口）：探一次再判定
+            if (Date.now() < httpNextTryAt || healingPort) return;
+            probeOurHttp(port, 2000).then((r) => {
+                if (r === 'live') { httpSpawnFails = 0; httpNextTryAt = 0; blockedWarned = false; return; }
+                if (r === 'refused') return;
+                httpSpawnFails++;
+                logMsg('startHttp: port ' + port + ' is listening but not answering as a live HTTP service (probe=' + r + ', fail #' + httpSpawnFails + ')');
+                if (httpSpawnFails >= 3) trySelfHealPort(context, port).catch(() => { });
+            });
+            return;
+        }
         // 已有实例还活着（可能只是正忙/暂不可连）：先等它，绝不再叠加新进程
         if (child && child.exitCode === null) return;
         if (Date.now() < httpNextTryAt) return;
@@ -440,9 +536,13 @@ function startHttp(context) {
         const args = ['--http', String(port), '--token', currentToken(cfg), '--parent-pid', String(process.pid)];
         const bindHost = cfg.get('http.host', '');
         if (bindHost) args.push('--bind', bindHost); // 默认 exe 只绑 127.0.0.1；显式配置局域网 IP 时才绑它
-        child = spawn(exe, args, { windowsHide: true, stdio: 'ignore' });
+        // 捕获 exe 的输出：关键诊断（bind 失败原因 / 孤儿 socket 提示等）都在 stderr，
+        // 原先 stdio:'ignore' 把它们全丢了，故障时只剩 probe=refused 无从定位。
+        child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        if (child.stdout) child.stdout.on('data', (d) => logMsg('http[out] ' + String(d).replace(/[\r\n]+$/, '')));
+        if (child.stderr) child.stderr.on('data', (d) => logMsg('http[err] ' + String(d).replace(/[\r\n]+$/, '')));
         child.on('error', (err) => vscode.window.showErrorMessage(vscode.l10n.t('WinExec MCP failed to start: {0}', err.message)));
-        child.on('exit', () => { child = null; });
+        child.on('exit', (code) => { logMsg('http: service exited (code ' + code + ')'); child = null; });
         // 3 秒后复查：ok=正常；refused=进程没起来（退避重试）；timeout=回环被拦截（提示一键修复）
         setTimeout(() => {
             probePort(port, 1500).then((r) => {
@@ -451,6 +551,8 @@ function startHttp(context) {
                 httpSpawnFails++;
                 httpNextTryAt = Date.now() + Math.min(15000 * Math.pow(2, Math.min(httpSpawnFails - 1, 3)), 120000);
                 logMsg('startHttp: port ' + port + ' probe=' + r + ' after spawn (fail #' + httpSpawnFails + '), backoff');
+                // refused=端口起不来（被占用），换端口能解决；timeout=防火墙拦截回环，换端口无用
+                if (r === 'refused' && httpSpawnFails >= 3) { trySelfHealPort(context, port).catch(() => { }); return; }
                 if (httpSpawnFails === 5 && r !== 'timeout') {
                     vscode.window.showWarningMessage('WinExec MCP: ' + vscode.l10n.t('the HTTP service still cannot be reached after several attempts (port {0}); retries have been slowed down - see Output → WinExec MCP', String(port)));
                 }

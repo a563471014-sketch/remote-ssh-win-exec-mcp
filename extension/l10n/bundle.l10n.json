@@ -34,5 +34,7 @@
 	"project mcp file failed to parse (it may contain comments); manual fix required": "project mcp file failed to parse (it may contain comments); manual fix required",
 	"cannot write the project mcp file ({0})": "cannot write the project mcp file ({0})",
 	"item missing": "item missing",
-	"item outdated": "item outdated"
+	"item outdated": "item outdated",
+	"port {0} is unusable (occupied by another program); switched to {1} and updated the configuration. Reload the window to apply.": "port {0} is unusable (occupied by another program); switched to {1} and updated the configuration. Reload the window to apply.",
+	"port {0} is unusable and no alternative port worked - see Output → WinExec MCP": "port {0} is unusable and no alternative port worked - see Output → WinExec MCP"
 }

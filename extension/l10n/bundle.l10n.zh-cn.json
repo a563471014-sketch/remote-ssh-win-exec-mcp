@@ -34,5 +34,7 @@
 	"project mcp file failed to parse (it may contain comments); manual fix required": "项目 mcp 文件解析失败（可能含注释），需手动处理",
 	"cannot write the project mcp file ({0})": "无法写入项目 mcp 文件（{0}）",
 	"item missing": "条目缺失",
-	"item outdated": "条目过期"
+	"item outdated": "条目过期",
+	"port {0} is unusable (occupied by another program); switched to {1} and updated the configuration. Reload the window to apply.": "端口 {0} 不可用（已被其它程序占用），已自动切换到 {1} 并更新配置，需重载窗口生效。",
+	"port {0} is unusable and no alternative port worked - see Output → WinExec MCP": "端口 {0} 不可用，且备选端口均无法启动；详见“输出 → WinExec MCP”"
 }
