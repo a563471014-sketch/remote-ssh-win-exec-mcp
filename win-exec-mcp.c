@@ -769,6 +769,32 @@ static void terminate_tree(HANDLE job, PROCESS_INFORMATION *pi) {
     }
 }
 
+/* ---- 根 Job：本进程退出时连带终止其全部后代 ----
+   per-call Job 刻意不设 kill-on-close（调用正常结束时 start /b 起的后台进程必须存活），
+   于是 exe 退出后这些后代无人认领、会一直跑下去（典型：占着串口的监控脚本）。
+   这里把本进程放进一个 KILL_ON_JOB_CLOSE 的根 Job：子进程创建时自动继承成员身份，
+   per-call Job 再赋给同一进程即形成嵌套（Windows 8+），两者互不干扰——
+   exe 存活期间后台进程照常存活；exe 退出（正常退出，或被 TerminateProcess 硬杀）时
+   句柄关闭，内核一并终止整棵后代树。
+   句柄不可继承，且 run_cmdline 用了句柄白名单，子进程不会持有它（否则 kill-on-close 失效）。 */
+static HANDLE g_root_job = NULL; /* 仅用于持有句柄（进程存活期间不得关闭） */
+static void init_root_job(void) {
+    HANDLE j = CreateJobObjectA(NULL, NULL);
+    if (!j) return;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+    memset(&li, 0, sizeof(li));
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof(li)) ||
+        !AssignProcessToJobObject(j, GetCurrentProcess())) {
+        /* 本进程已属于某个不允许嵌套的 Job → 放弃，退回旧行为（后代可能在 exe 退出后残留） */
+        fprintf(stderr, "root job unavailable (err %lu); descendants may outlive this process\n",
+                (unsigned long)GetLastError());
+        CloseHandle(j);
+        return;
+    }
+    g_root_job = j;
+}
+
 /* ---- 在飞请求表（HTTP：notifications/cancelled → 杀对应进程树） ---- */
 static CRITICAL_SECTION g_inflight_cs;
 static int g_inflight_ready = 0;
@@ -941,8 +967,14 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
     /* Job Object：超时/取消/断连时用 TerminateJobObject 杀整棵进程树。
        故意不设 KILL_ON_JOB_CLOSE——正常结束时 start /b 起的后台子进程必须存活
        （"后台+轮询"模式依赖它）；未能加入 job 时退回 TerminateProcess+taskkill /T。 */
+    /* 进程此时已是根 Job 成员（继承），此处赋给 per-call Job 形成嵌套（Windows 8+）；
+       失败则退回 TerminateProcess + taskkill /T —— 注意该回退对 start /b 脱离的后台进程无效。 */
     HANDLE job = CreateJobObjectA(NULL, NULL);
-    if (job && !AssignProcessToJobObject(job, pi.hProcess)) { CloseHandle(job); job = NULL; }
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        fprintf(stderr, "per-call job assign failed (err %lu); timeout/cancel falls back to taskkill\n",
+                (unsigned long)GetLastError());
+        CloseHandle(job); job = NULL;
+    }
     if (job && g_http_mode && g_inflight_ready && g_cur_reqid[0]) inflight_add(g_cur_reqid, job);
 
     /* 读输出（管道阻塞读，进程退出后读到 EOF） */
@@ -1699,6 +1731,7 @@ static int http_main(int port, const char *token, DWORD parent_pid, const char *
 
 int main(int argc, char **argv) {
     load_env_config();
+    init_root_job();
     InitializeCriticalSection(&g_inflight_cs);
     g_inflight_ready = 1;
     detect_git_bash();

@@ -27,7 +27,7 @@ Remote-SSH 场景里 agent 跑在 Linux，但很多东西只存在于 Windows �
 
 - **实时输出**：长命令通过 `notifications/progress` 流式回报（客户端带 `progressToken` 时，VS Code 会带）。消息按完整行、限流发送（0.3.9 起默认 30ms / 单条最多 60000 字节）；溢出部分标注 `…[跳过 N 行]…`；最终结果仍含完整输出。
 - **超大结果**：超过 512KB 落盘到 `%TEMP%\win-exec-mcp\out-<时间>-<pid>-<seq>.log`，工具只回传尾部 + 完整日志路径；旧文件在每次写入时惰性回收（保留最新 20 个、删除超过 7 天的；`WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`，`0` = 关闭该规则）。
-- **终止**：超时、客户端取消（`notifications/cancelled`）或断连会终止**整棵进程树**（Job Object，兜底 `taskkill /T`）；刻意 `start /b` 的后台任务在正常结束时保留。
+- **终止**：超时、客户端取消（`notifications/cancelled`）或断连会终止**整棵进程树**（Job Object，兜底 `taskkill /T`）；刻意 `start /b` 的后台任务在服务存活期间保留，但**服务（exe）退出时会被一并终止**（自 0.4.4 起用 root Job + kill-on-close 实现）——VS Code 关闭 / 服务被杀后，它们不会再留着占端口、串口或句柄。
 - **HTTP 服务**：默认只绑 `127.0.0.1`（`--bind 0.0.0.0` 或 `winExecMcp.http.host` 可到局域网），并用 `SO_EXCLUSIVEADDRUSE`：同端口第二个实例直接 bind 失败退出，不会堆叠；扩展 watchdog 在子进程存活时绝不重复拉起，并在连续失败时退避。
 - **环境变量**：`WINEXEC_PROGRESS_MS`（默认 30）、`WINEXEC_PROGRESS_BYTES`（默认 60000）、`WINEXEC_MAX_RESULT_BYTES`（默认 524288，`0` 关闭落盘）、`WINEXEC_SPILL_KEEP`（默认 20）、`WINEXEC_SPILL_KEEP_DAYS`（默认 7）、`WINEXEC_GITBASH`（显式指定 `bash.exe`）、`WINEXEC_DEBUG`（启动诊断到 stderr）。
 
@@ -136,7 +136,7 @@ returns over the MCP channel (optionally through the SSH encrypted tunnel).
 
 - **Live output**: long-running commands stream output to the client via `notifications/progress` (when the client sends a `progressToken` — VS Code does). Messages are line-aligned and rate-limited (30 ms, up to 60000 bytes per message by default since 0.3.9 — typical output arrives without gaps); when more accumulates than one window holds, the omitted part is marked as `…[skipped N lines]…`. The final result still carries the full output.
 - **Large results**: outputs over 512KB are spilled to `%TEMP%\win-exec-mcp\out-<timestamp>-<pid>-<seq>.log`; the tool result returns the tail plus the full log path. Old spill files are reclaimed lazily on each write (keep the newest 20, drop anything older than 7 days — `WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`, `0` disables either rule).
-- **Termination**: timeout, client cancellation (`notifications/cancelled`) or client disconnect terminate the **whole process tree** (Job Object, `taskkill /T` fallback). Deliberately-detached background jobs (`start /b …`) survive normal completion.
+- **Termination**: timeout, client cancellation (`notifications/cancelled`) or client disconnect terminate the **whole process tree** (Job Object, `taskkill /T` fallback). Deliberately-detached background jobs (`start /b …`) survive normal completion but are terminated **when the service (exe) exits** (0.4.4+: root job + kill-on-close) — so they no longer keep ports, COM handles or files busy after VS Code is closed or the service is killed.
 - **HTTP service**: binds `127.0.0.1` by default (`--bind 0.0.0.0` or `winExecMcp.http.host` for LAN) and uses `SO_EXCLUSIVEADDRUSE` — a second instance on the same port fails to bind and exits immediately (no instance pile-up; the extension watchdog never spawns a duplicate while its own child is alive, and backs off on repeated failures).
 - **Environment variables**: `WINEXEC_PROGRESS_MS` (default 30), `WINEXEC_PROGRESS_BYTES` (default 60000), `WINEXEC_MAX_RESULT_BYTES` (default 524288, `0` disables spilling), `WINEXEC_SPILL_KEEP` (default 20, spill files kept per directory, `0` disables count-based cleanup), `WINEXEC_SPILL_KEEP_DAYS` (default 7, max age in days, `0` disables age-based cleanup), `WINEXEC_GITBASH` (explicit `bash.exe` path override), `WINEXEC_DEBUG` (startup diagnostics to stderr).
 
