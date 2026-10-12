@@ -409,6 +409,8 @@ static __thread int    g_pseq = 0;        /* progress 递增序号 */
 static __thread DWORD  g_p_last_ms = 0;   /* 上次发送时间（限流 ~10/s） */
 static __thread int    g_streaming = 0;   /* HTTP：本次响应已开始 SSE 流式 */
 static __thread SOCKET g_stream_sock = 0; /* HTTP：流式响应所用连接 */
+static __thread SOCKET g_conn_sock = 0;   /* HTTP：本次请求的连接（未流式时也能探活） */
+static __thread DWORD  g_probe_last_ms = 0; /* 上次探活时间（空闲心跳限流） */
 static __thread char   g_cur_reqid[80];   /* 当前 tools/call 的 request id（取消匹配用） */
 static __thread int    g_client_gone = 0; /* 发送失败/管道错误 → 客户端已走，应终止命令 */
 static __thread char  *g_prog_last = NULL;/* 上一条进度消息（相邻去重） */
@@ -466,6 +468,37 @@ static int send_all(SOCKET s, const char *buf, int len) {
         off += n;
     }
     return 1;
+}
+
+/* 客户端存活探测。
+   长驻低输出命令没有新输出 → 没有 progress 可发 → 「写失败=客户端已走」这个唯一的断连
+   信号永远不会被触发，客户端被 kill -9 / SSH 掉线后进程树会一直残留（典型后果：串口被占死）。
+   这里在等待子进程的空转里定期主动探活：
+   - 对端已关闭：套接字可读且 MSG_PEEK 读到 0（FIN/RST 已到）；
+   - 流式连接额外写一条 SSE 注释行（规范要求客户端忽略，兼防代理/隧道空闲超时），写失败即断开。 */
+#define CLIENT_PROBE_MS 5000
+static int client_probe(void) {
+    if (!g_http_mode) return 0;
+    DWORD now = GetTickCount();
+    if (g_probe_last_ms && now - g_probe_last_ms < CLIENT_PROBE_MS) return 0;
+    g_probe_last_ms = now;
+    if (g_conn_sock) {
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(g_conn_sock, &rf);
+        struct timeval tv = { 0, 0 };
+        if (select(0, &rf, NULL, NULL, &tv) > 0) {
+            char tmp[256];
+            int n = recv(g_conn_sock, tmp, sizeof(tmp), MSG_PEEK);
+            if (n == 0) return 1;                                       /* 对端已关闭 */
+            if (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK) return 1; /* 连接已失效 */
+        }
+    }
+    if (g_streaming && g_stream_sock) {
+        static const char sse_ka[] = ": keepalive\n\n";
+        if (!send_all(g_stream_sock, sse_ka, (int)sizeof(sse_ka) - 1)) return 1;
+    }
+    return 0;
 }
 
 /* 发送一条 notifications/progress（text 必须是合法 UTF-8） */
@@ -998,7 +1031,9 @@ static RunResult run_cmdline(const char *cmd_line_in, int timeout_ms) {
             progress_scan(out, olen, &emitted, 0);
             got = 1;
         }
-        /* 客户端断开（progress 发送失败）→ 终止整树 */
+        /* 空闲探活：静默期没有 progress 可发，只能靠主动探测发现客户端已走 */
+        if (!g_client_gone && client_probe()) g_client_gone = 1;
+        /* 客户端断开（发送失败或探活失败）→ 终止整树 */
         if (g_client_gone) {
             terminate_tree(job, &pi);
             rr.aborted = 2;
@@ -1500,6 +1535,7 @@ static const char *g_token = NULL;
 
 static DWORD WINAPI http_client_thread(LPVOID arg) {
     SOCKET s = (SOCKET)(intptr_t)arg;
+    g_conn_sock = s; /* 供 client_probe 探活（每连接一线程，run_cmd 与探活同线程） */
     char buf[16384];
     int total = 0;
     int header_end = -1;
