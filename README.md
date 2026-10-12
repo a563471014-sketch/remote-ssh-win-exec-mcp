@@ -21,15 +21,24 @@ Remote-SSH 场景里 agent 跑在 Linux，但很多东西只存在于 Windows �
 
 | 工具 | 参数 | 返回 |
 |---|---|---|
-| `windows_exec` | `command`（必填，cmd 语法，支持 `&&` / 管道）、`timeout_ms`（默认 30000）、`shell`（默认 `cmd`，`gitbash` 用于 Linux 风格命令与 .sh 脚本） | `[exit: N]` + stdout/stderr（UTF-8） |
+| `windows_exec` | `command`（必填，cmd 语法，支持 `&&` / 管道）、`timeout_ms`（默认 30000，上限 24h）、`cwd`（工作目录，可选）、`shell`（`cmd` 默认 / `gitbash` / `powershell`——pwsh 7 优先、自动回退 5.1）、`env`（可选，`{"KEY":"VAL"}` 叠加环境变量，`null` 删除）、`stdin`（可选，文本喂给子进程 stdin） | `[exit: N]` + stdout/stderr（UTF-8，逐行判定编码）；结构化字段在 `structuredContent`：`exitCode`/`timedOut`/`cancelled`/`outputTruncated`/`spillPath` 等 |
+| `windows_fs_put` | `path`（必填，Windows 绝对路径，父目录自动创建）、`content` 或 `content_base64`（二选一，文本/base64）、`offset`（可选，默认 0=创建/覆盖；>0 分块续传） | 写入确认；`structuredContent`：`path`/`bytesWritten`/`offset`/`size` |
+| `windows_fs_get` | `path`（必填）、`offset`/`length`（可选，单次上限 4MB）、`as`（`base64` 默认（无损）/`text`（编码探测）） | 文件内容（base64 或文本）；`structuredContent`：`path`/`size`/`offset`/`bytesRead`/`eof`/`as` |
+| `windows_bg_start` | `command`（必填）、`shell`/`cwd`/`env`（可选） | `jobId`/`pid`/`logPath`；完整输出落盘 |
+| `windows_bg_poll` | `job_id`（必填）、`wait_ms`（可选 0–30000 长轮询）、`max_bytes`（可选，默认 64KB） | 增量输出（`content`）+ `{running, exitCode, killed, unreadBytes, logPath, elapsedMs}` |
+| `windows_bg_kill` | `job_id`（必填） | 终止整棵进程树 |
+| `windows_bg_list` | —（无参数） | 所有后台作业及状态 |
+| `windows_env` | —（无参数） | OS/主机/管理员、git-bash/pwsh 路径、工具链存在性、串口列表、磁盘余量、代理 |
 
 ### 行为要点
 
 - **实时输出**：长命令通过 `notifications/progress` 流式回报（客户端带 `progressToken` 时，VS Code 会带）。消息按完整行、限流发送（0.3.9 起默认 30ms / 单条最多 60000 字节）；溢出部分标注 `…[跳过 N 行]…`；最终结果仍含完整输出。
-- **超大结果**：超过 512KB 落盘到 `%TEMP%\win-exec-mcp\out-<时间>-<pid>-<seq>.log`，工具只回传尾部 + 完整日志路径；旧文件在每次写入时惰性回收（保留最新 20 个、删除超过 7 天的；`WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`，`0` = 关闭该规则）。
-- **终止**：超时、客户端取消（`notifications/cancelled`）或断连会终止**整棵进程树**（Job Object，兜底 `taskkill /T`）；刻意 `start /b` 的后台任务在服务存活期间保留，但**服务（exe）退出时会被一并终止**（自 0.4.4 起用 root Job + kill-on-close 实现）——VS Code 关闭 / 服务被杀后，它们不会再留着占端口、串口或句柄。
+- **超大结果**：超过 512KB 落盘到 `%TEMP%\win-exec-mcp\out-<时间>-<pid>-<seq>.log`，工具只回传尾部 + 完整日志路径；输出在**运行中**超过 16MB 时也会立即改为边跑边写同一个落盘文件（**不再丢弃数据**，结果同样只回"路径 + 末尾"）；旧文件在每次写入时惰性回收（保留最新 20 个、删除超过 7 天的；`WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`，`0` = 关闭该规则）。
+- **文件互传**：`windows_fs_put` / `windows_fs_get` 在 Linux ↔ Windows 间直传文件（脚本、配置、固件、日志、二进制）——不再受 32K 命令行上限与 echo 转义限制。二进制走 `content_base64`（读取默认返回无损 base64）；单次 ≤4MB，大文件按 `offset` 分块续传（`put` 的 `offset=0` 为创建/覆盖、重试幂等；`get` 返回 `eof` 供循环读取）；`put` 的父目录不存在会自动创建；`get` 的 `as:"text"` 做逐行编码探测（GBK/UTF-8 混排文本直接可读）。
+- **后台作业**：`windows_bg_start` 起长驻进程（服务器/监听/串口监控）并立即返回 `job_id`；`windows_bg_poll(job_id, wait_ms?)` 增量取输出（长轮询：有新输出或退出即返回；等待结束用 `running`/`exitCode` 判断）；`windows_bg_kill` 杀整树；`windows_bg_list` 总览。完整输出落盘 `bg-*.log`（与结果落盘同池回收）；同时最多 16 个作业，**服务退出时全部作业进程树一并回收**。
+- **终止**：超时、客户端取消（`notifications/cancelled`）或断连会终止**整棵进程树**（Job Object，兜底 `taskkill /T`）。断连检测不依赖"有输出可推"：服务在等待期间每 5 秒主动探活（HTTP = `select`+`MSG_PEEK` 判对端关闭，并向 SSE 流写保活注释；stdio = stdin 断了**且** stdout 写不进去才判定，`echo … | win-exec-mcp.exe` 这类一次性调用不会被误杀，`WINEXEC_PROBE_MS` 可调）——串口监听这类**静默长命令**在客户端被强杀 / SSH 掉线后也会被回收。刻意 `start /b` 的后台任务在服务存活期间保留，但**服务（exe）退出时会被一并终止**（自 0.4.4 起用 root Job + kill-on-close 实现）。
 - **HTTP 服务**：默认只绑 `127.0.0.1`（`--bind 0.0.0.0` 或 `winExecMcp.http.host` 可到局域网），并用 `SO_EXCLUSIVEADDRUSE`：同端口第二个实例直接 bind 失败退出，不会堆叠；扩展 watchdog 在子进程存活时绝不重复拉起，并在连续失败时退避。
-- **环境变量**：`WINEXEC_PROGRESS_MS`（默认 30）、`WINEXEC_PROGRESS_BYTES`（默认 60000）、`WINEXEC_MAX_RESULT_BYTES`（默认 524288，`0` 关闭落盘）、`WINEXEC_SPILL_KEEP`（默认 20）、`WINEXEC_SPILL_KEEP_DAYS`（默认 7）、`WINEXEC_GITBASH`（显式指定 `bash.exe`）、`WINEXEC_DEBUG`（启动诊断到 stderr）。
+- **环境变量**：`WINEXEC_PROGRESS_MS`（默认 30）、`WINEXEC_PROGRESS_BYTES`（默认 60000）、`WINEXEC_MAX_RESULT_BYTES`（默认 524288，`0` 关闭落盘）、`WINEXEC_SPILL_KEEP`（默认 20）、`WINEXEC_SPILL_KEEP_DAYS`（默认 7）、`WINEXEC_PROBE_MS`（默认 5000，断连探活间隔毫秒）、`WINEXEC_TOKEN`（HTTP 鉴权 token，替代 `--token`，避免出现在命令行）、`WINEXEC_GITBASH`（显式指定 `bash.exe`）、`WINEXEC_DEBUG`（启动诊断到 stderr）。
 
 ### 安装（三种方式）
 
@@ -130,15 +139,24 @@ returns over the MCP channel (optionally through the SSH encrypted tunnel).
 
 | tool | params | returns |
 |---|---|---|
-| `windows_exec` | `command` (required, cmd syntax, `&&` / pipes ok), `timeout_ms` (default 30000), `shell` (`cmd` default / `gitbash` for Linux-style commands and .sh scripts) | `[exit: N]` + stdout/stderr (UTF-8) |
+| `windows_exec` | `command` (required, cmd syntax, `&&` / pipes ok), `timeout_ms` (default 30000, max 24h), `cwd` (working directory, optional), `shell` (`cmd` default / `gitbash` / `powershell` — pwsh 7 preferred, auto-falls back to 5.1), `env` (optional `{"KEY":"VAL"}` overlay; `null` removes), `stdin` (optional text fed to the child's stdin) | `[exit: N]` + stdout/stderr (UTF-8, per-line encoding detection); structured fields in `structuredContent`: `exitCode`/`timedOut`/`cancelled`/`outputTruncated`/`spillPath` … |
+| `windows_fs_put` | `path` (required, Windows absolute path, parent dirs auto-created), `content` or `content_base64` (one of, text/base64), `offset` (optional, default 0 = create/overwrite; >0 for chunked upload) | write ack; `structuredContent`: `path`/`bytesWritten`/`offset`/`size` |
+| `windows_fs_get` | `path` (required), `offset`/`length` (optional, ≤4MB per call), `as` (`base64` default (lossless) / `text` (encoding detection)) | file content (base64 or text); `structuredContent`: `path`/`size`/`offset`/`bytesRead`/`eof`/`as` |
+| `windows_bg_start` | `command` (required), `shell`/`cwd`/`env` (optional) | `jobId`/`pid`/`logPath`; full output spilled to disk |
+| `windows_bg_poll` | `job_id` (required), `wait_ms` (optional 0–30000 long-poll), `max_bytes` (optional, 64KB default) | incremental output (`content`) + `{running, exitCode, killed, unreadBytes, logPath, elapsedMs}` |
+| `windows_bg_kill` | `job_id` (required) | terminates the whole process tree |
+| `windows_bg_list` | — | all background jobs and their status |
+| `windows_env` | — | OS/host/admin, git-bash/pwsh paths, toolchain presence, COM ports, disks, proxy |
 
 ### Behavior notes
 
 - **Live output**: long-running commands stream output to the client via `notifications/progress` (when the client sends a `progressToken` — VS Code does). Messages are line-aligned and rate-limited (30 ms, up to 60000 bytes per message by default since 0.3.9 — typical output arrives without gaps); when more accumulates than one window holds, the omitted part is marked as `…[skipped N lines]…`. The final result still carries the full output.
-- **Large results**: outputs over 512KB are spilled to `%TEMP%\win-exec-mcp\out-<timestamp>-<pid>-<seq>.log`; the tool result returns the tail plus the full log path. Old spill files are reclaimed lazily on each write (keep the newest 20, drop anything older than 7 days — `WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`, `0` disables either rule).
-- **Termination**: timeout, client cancellation (`notifications/cancelled`) or client disconnect terminate the **whole process tree** (Job Object, `taskkill /T` fallback). Deliberately-detached background jobs (`start /b …`) survive normal completion but are terminated **when the service (exe) exits** (0.4.4+: root job + kill-on-close) — so they no longer keep ports, COM handles or files busy after VS Code is closed or the service is killed.
+- **Large results**: outputs over 512KB are spilled to `%TEMP%\win-exec-mcp\out-<timestamp>-<pid>-<seq>.log`; the tool result returns the tail plus the full log path. Output that exceeds 16MB **while still running** switches to streaming into the same spill file as it arrives (**nothing is dropped**; the result again carries the path plus the tail). Old spill files are reclaimed lazily on each write (keep the newest 20, drop anything older than 7 days — `WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`, `0` disables either rule).
+- **File transfer**: `windows_fs_put` / `windows_fs_get` move files between Linux ↔ Windows directly (scripts, configs, firmware, logs, binaries) — no more 32K command-line limit or echo escaping. Binary goes through `content_base64` (reads default to lossless base64); ≤4MB per call, larger files chunked via `offset` (`put` with `offset=0` creates/overwrites and first-chunk retry is idempotent; `get` reports `eof` for loop reads); missing parent directories are auto-created on `put`; `get` with `as:"text"` applies per-line encoding detection (mixed GBK/UTF-8 text reads correctly).
+- **Background jobs**: `windows_bg_start` launches a long-running process (server/listener/serial monitor) and immediately returns a `job_id`; `windows_bg_poll(job_id, wait_ms?)` streams incremental output (long-poll: returns on new output or exit; use `running`/`exitCode` to wait for completion); `windows_bg_kill` terminates the whole tree; `windows_bg_list` shows all jobs. Full output spilled to `bg-*.log` (reclaimed together with tool-result spill files); up to 16 concurrent jobs, and all job trees are reclaimed **when the service exits**.
+- **Termination**: timeout, client cancellation (`notifications/cancelled`) or client disconnect terminate the **whole process tree** (Job Object, `taskkill /T` fallback). Disconnect detection no longer depends on having output to push: while waiting, the service probes every 5s (HTTP = `select` + `MSG_PEEK` for a closed peer plus a keepalive SSE comment; stdio = only when stdin is broken **and** stdout is unwritable, so one-shot `echo … | win-exec-mcp.exe` calls are not killed by mistake; tune with `WINEXEC_PROBE_MS`) — so silent long-running commands (serial monitors) are reclaimed even if the client is force-killed or the SSH link drops. Deliberately-detached background jobs (`start /b …`) survive normal completion but are terminated **when the service (exe) exits** (0.4.4+: root job + kill-on-close).
 - **HTTP service**: binds `127.0.0.1` by default (`--bind 0.0.0.0` or `winExecMcp.http.host` for LAN) and uses `SO_EXCLUSIVEADDRUSE` — a second instance on the same port fails to bind and exits immediately (no instance pile-up; the extension watchdog never spawns a duplicate while its own child is alive, and backs off on repeated failures).
-- **Environment variables**: `WINEXEC_PROGRESS_MS` (default 30), `WINEXEC_PROGRESS_BYTES` (default 60000), `WINEXEC_MAX_RESULT_BYTES` (default 524288, `0` disables spilling), `WINEXEC_SPILL_KEEP` (default 20, spill files kept per directory, `0` disables count-based cleanup), `WINEXEC_SPILL_KEEP_DAYS` (default 7, max age in days, `0` disables age-based cleanup), `WINEXEC_GITBASH` (explicit `bash.exe` path override), `WINEXEC_DEBUG` (startup diagnostics to stderr).
+- **Environment variables**: `WINEXEC_PROGRESS_MS` (default 30), `WINEXEC_PROGRESS_BYTES` (default 60000), `WINEXEC_MAX_RESULT_BYTES` (default 524288, `0` disables spilling), `WINEXEC_SPILL_KEEP` (default 20, spill files kept per directory, `0` disables count-based cleanup), `WINEXEC_SPILL_KEEP_DAYS` (default 7, max age in days, `0` disables age-based cleanup), `WINEXEC_PROBE_MS` (default 5000, liveness probe interval in ms), `WINEXEC_TOKEN` (HTTP bearer token — preferred over `--token`, keeps it out of the process command line), `WINEXEC_GITBASH` (explicit `bash.exe` path override), `WINEXEC_DEBUG` (startup diagnostics to stderr).
 
 ### Install (three ways)
 

@@ -483,8 +483,8 @@ async function trySelfHealPort(context, fromPort) {
         const token = currentToken(cfg);
         for (let p = fromPort + 1; p <= fromPort + 10; p++) {
             if (await isPortListening(p)) continue;
-            const c = spawn(exe, ['--http', String(p), '--token', token, '--parent-pid', String(process.pid)],
-                { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+            const c = spawn(exe, ['--http', String(p), '--parent-pid', String(process.pid)],
+                { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WINEXEC_TOKEN: token } });
             if (c.stdout) c.stdout.on('data', (d) => logMsg('http[out] ' + String(d).replace(/[\r\n]+$/, '')));
             if (c.stderr) c.stderr.on('data', (d) => logMsg('http[err] ' + String(d).replace(/[\r\n]+$/, '')));
             await new Promise((r) => setTimeout(r, 1200));
@@ -533,12 +533,13 @@ function startHttp(context) {
             vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('bundled exe is missing {0}', exe));
             return;
         }
-        const args = ['--http', String(port), '--token', currentToken(cfg), '--parent-pid', String(process.pid)];
+        const args = ['--http', String(port), '--parent-pid', String(process.pid)];
         const bindHost = cfg.get('http.host', '');
         if (bindHost) args.push('--bind', bindHost); // 默认 exe 只绑 127.0.0.1；显式配置局域网 IP 时才绑它
         // 捕获 exe 的输出：关键诊断（bind 失败原因 / 孤儿 socket 提示等）都在 stderr，
         // 原先 stdio:'ignore' 把它们全丢了，故障时只剩 probe=refused 无从定位。
-        child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        // token 走环境变量而不是命令行：进程列表/任务管理器里看不到它（--token 仍兼容）
+        child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WINEXEC_TOKEN: currentToken(cfg) } });
         if (child.stdout) child.stdout.on('data', (d) => logMsg('http[out] ' + String(d).replace(/[\r\n]+$/, '')));
         if (child.stderr) child.stderr.on('data', (d) => logMsg('http[err] ' + String(d).replace(/[\r\n]+$/, '')));
         child.on('error', (err) => vscode.window.showErrorMessage(vscode.l10n.t('WinExec MCP failed to start: {0}', err.message)));

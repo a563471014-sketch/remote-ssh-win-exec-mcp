@@ -13,7 +13,7 @@
 ### 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.4.5.vsix
+code --install-extension win-exec-mcp-0.5.0.vsix
 ```
 
 → **Reload Window** → 首次激活弹窗，按用途二选一：
@@ -29,12 +29,15 @@ code --install-extension win-exec-mcp-0.4.5.vsix
 
 - **stdio（`win-exec-mcp`）**：注册到用户级 `mcp.json`（location: local），Windows 客户端拉起进程，走 Remote-SSH 通道 —— VS Code 内建 agent 可用
 - **http**：注册到项目级 `.vscode/mcp.json` / `.mcp.json`，默认 URL `http://127.0.0.1:<ssh.localPort>/mcp`（SSH 回环隧道，与 IP 无关；设置 `http.host` 后改为局域网直连）—— 供 VS Code 之外的客户端（Claude Code 等）使用；进程仅远端窗口自动拉起
-- 工具：`windows_exec(command, timeout_ms?=30000, shell?="cmd")`，支持 `&&`、管道等 cmd 语法；`shell:"gitbash"` 可用 git-bash 执行 Linux 风格命令 / .sh 脚本（自动检测本机 git-bash，未安装时明确报错）
+- 工具：`windows_exec(command, timeout_ms?=30000, cwd?, shell?="cmd")`，支持 `&&` 、管道等 cmd 语法；`cwd` 指定工作目录（不传则用服务所在目录）；`shell:"gitbash"` 可用 git-bash 执行 Linux 风格命令 / .sh 脚 本（自动检测本机 git-bash，未安装时明确报错）
+- 文件互传：`windows_fs_put(path, content|content_base64, offset?)` / `windows_fs_get(path, offset?, length?, as?="base64")` —— 脚本/配置/固件/日志/二进制在 Linux ↔ Windows 间直传，不再受 32K 命令行上限限制；单次 ≤4MB，大文件按 `offset` 分块续传（`put` 父目录自动创建、`offset=0` 创建/覆盖；`get` 返回 `eof`，`as:"text"` 做编码探测）
+- 执行增强：`shell:"powershell"`（pwsh 7 优先、回退 5.1）；`env`（{"KEY":"VAL"} 叠加环境变量）；`stdin`（文本喂给子进程）；`windows_env` 工具一次摸清 OS/工具链/串口/磁盘/代理
+- 后台作业：`windows_bg_start / poll / kill / list` —— 长驻进程（服务器/串口监听）起任务拿 job_id，poll 增量取输出（支持 wait_ms 长轮询），kill 杀整树；完整输出落盘 `bg-*.log` 并随旧文件回收；服务退出时全部作业进程树一并回收
 - 长命令输出实时推送（客户端带 progressToken 时；按完整行 + 限流）：0.3.9 起默认 30ms / 60000B 窗口，常见刷屏输出不再出现 `跳过 N 行` 标注；最终结果仍含完整输出
-- 结果超 512KB 自动落盘（`%TEMP%\win-exec-mcp\out-*.log`），只回传尾部与日志路径；落盘后自动回收旧文件（保留最近 20 个、并删除超过 7 天的，见 `WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`）
-- 超时 / 客户端取消 / 断连 → 终止**整棵进程树**（Job Object；兜底 taskkill /T）
+- 结果超 512KB 自动落盘（`%TEMP%\win-exec-mcp\out-*.log`），只回传尾部与日志路径；**运行中**超 16MB 也会改为边跑边写该文件（不丢数据）；落盘后自动回收旧文件（保留最近 20 个、并删除超过 7 天的，见 `WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`）
+- 超时 / 客户端取消 / 断连 → 终止**整棵进程树**（Job Object；兜底 taskkill /T）；断连检测在静默期也生效（每 5s 主动探活），串口监听这类长命令不会因客户端被强杀而残留
 - HTTP 服务默认只绑 `127.0.0.1`（`http.host` 可指定局域网），`SO_EXCLUSIVEADDRUSE` 单实例：同端口第二个实例直接 bind 失败退出，不会堆叠
-- 环境变量：`WINEXEC_PROGRESS_MS`（默认 30，进度最小间隔毫秒）/ `WINEXEC_PROGRESS_BYTES`（默认 60000，单条进度窗口字节）/ `WINEXEC_MAX_RESULT_BYTES`（默认 524288，0=关闭落盘）/ `WINEXEC_SPILL_KEEP`（默认 20，落盘目录保留个数，0=不按个数清理）/ `WINEXEC_SPILL_KEEP_DAYS`（默认 7，落盘文件最长保留天数，0=不按天数清理）/ `WINEXEC_GITBASH` / `WINEXEC_DEBUG`
+- 环境变量：`WINEXEC_PROGRESS_MS`（默认 30，进度最小间隔毫秒）/ `WINEXEC_PROGRESS_BYTES`（默认 60000，单条进度窗口字节）/ `WINEXEC_MAX_RESULT_BYTES`（默认 524288，0=关闭落盘）/ `WINEXEC_SPILL_KEEP`（默认 20，落盘目录保留个数，0=不按个数清理）/ `WINEXEC_SPILL_KEEP_DAYS`（默认 7，落盘文件最长保留天数，0=不按天数清理）/ `WINEXEC_PROBE_MS`（默认 5000，断连探活间隔）/ `WINEXEC_TOKEN`（HTTP token，避免出现在命令行）/ `WINEXEC_GITBASH` / `WINEXEC_DEBUG`
 
 > **固定服务路径（0.3.8+）**：exe 始终从 `%LOCALAPPDATA%\win-exec-mcp\bin\win-exec-mcp.exe` 运行（升级时原地替换）——防火墙/安全软件按“路径”记授权，放行一次后升级不再重复弹窗、也不会被误拦。若服务连不上（端口连接超时＝被拦截）：运行命令 `WinExec MCP: 修复防火墙权限（管理员）`（UAC 确认后自动清除阻止规则、放行路径并清理残留进程），然后重载窗口。若机器上装有自带网络防护、且不写 Windows 防火墙规则的第三方安全软件（360、火绒、腾讯电脑管家等），一键修复可能清不掉它的拦截——请在它的信任/放行列表里加入上述固定路径（或临时退出该软件验证）。
 
@@ -61,7 +64,7 @@ UI text follows the VS Code display language (English / Simplified Chinese); no 
 ### Install and go
 
 ```
-code --install-extension win-exec-mcp-0.4.5.vsix
+code --install-extension win-exec-mcp-0.5.0.vsix
 ```
 
 → **Reload Window** → pick one of the two scopes in the consent dialog:
@@ -96,12 +99,15 @@ The extension only modifies files after you answer the consent dialog. Once auth
 
 - **stdio (`win-exec-mcp`)**: registered in the user-level `mcp.json` (`location: local`); the Windows client spawns the process and it is reached over the Remote-SSH channel — this is what the VS Code built-in agent uses.
 - **http**: registered in the project `.vscode/mcp.json` / `.mcp.json`; default URL `http://127.0.0.1:<ssh.localPort>/mcp` (SSH loopback tunnel, independent of LAN IPs; set `http.host` for direct LAN access) — for clients outside VS Code (Claude Code etc.). The process is auto-started only in remote windows.
-- Tool: `windows_exec(command, timeout_ms?=30000, shell?="cmd")` — cmd syntax including `&&` and pipes; `shell:"gitbash"` runs Linux-style commands / `.sh` scripts through git-bash (auto-detected; a clear error is reported when git-bash is not installed).
+- Tool: `windows_exec(command, timeout_ms?=30000, cwd?, shell?="cmd")` — cmd syntax including `&&` and pipes; `cwd` sets the working directory (defaults to the service's own directory); `shell:"gitbash"` runs Linux-style commands / `.sh` scripts through git-bash (auto-detected; a clear error is reported when git-bash is not installed).
+- File transfer: `windows_fs_put(path, content|content_base64, offset?)` / `windows_fs_get(path, offset?, length?, as?="base64")` — move scripts/configs/firmware/logs/binaries between Linux ↔ Windows directly, free of the 32K command-line limit; ≤4MB per call, larger files chunked via `offset` (put auto-creates parent dirs and `offset=0` creates/overwrites; get reports `eof`; `as:"text"` applies encoding detection).
+- Exec enhancements: `shell:"powershell"` (pwsh 7 preferred, falls back to 5.1); `env` (`{"KEY":"VAL"}` overlay); `stdin` (text fed to the child); `windows_env` tool for a one-shot OS/toolchain/COM/disks/proxy overview.
+- Background jobs: `windows_bg_start / poll / kill / list` — launch long-running processes (servers, serial monitors), poll incremental output (with `wait_ms` long-poll), kill the whole tree; full output spilled to `bg-*.log` (reclaimed with old spill files); all job trees are reclaimed when the service exits.
 - **Live output**: long-running commands stream line-aligned, rate-limited progress (30 ms / 60000 bytes by default since 0.3.9), so typical output no longer shows `skipped N lines` markers; the final result still carries the full output.
-- **Large results**: outputs over 512KB are spilled to `%TEMP%\win-exec-mcp\out-*.log`; the tool result returns the tail plus the log path, and old spill files are reclaimed automatically (keep the newest 20, drop anything older than 7 days — `WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`).
-- Timeout, client cancellation or disconnect terminate the **whole process tree** (Job Object, `taskkill /T` fallback).
+- **Large results**: outputs over 512KB are spilled to `%TEMP%\win-exec-mcp\out-*.log`; the tool result returns the tail plus the log path, and old spill files are reclaimed automatically (keep the newest 20, drop anything older than 7 days — `WINEXEC_SPILL_KEEP` / `WINEXEC_SPILL_KEEP_DAYS`). Output that exceeds 16MB **while running** is streamed into that file as it arrives — nothing is dropped.
+- Timeout, client cancellation or disconnect terminate the **whole process tree** (Job Object, `taskkill /T` fallback); disconnect detection also works during silent periods (a liveness probe every 5s), so a long-running command is not left behind when the client is force-killed.
 - The HTTP service binds `127.0.0.1` by default (`http.host` for LAN) and uses `SO_EXCLUSIVEADDRUSE`: a second instance on the same port fails to bind and exits instead of piling up.
-- Environment variables: `WINEXEC_PROGRESS_MS` (default 30) / `WINEXEC_PROGRESS_BYTES` (default 60000) / `WINEXEC_MAX_RESULT_BYTES` (default 524288, `0` disables spilling) / `WINEXEC_SPILL_KEEP` (default 20) / `WINEXEC_SPILL_KEEP_DAYS` (default 7) / `WINEXEC_GITBASH` / `WINEXEC_DEBUG`.
+- Environment variables: `WINEXEC_PROGRESS_MS` (default 30) / `WINEXEC_PROGRESS_BYTES` (default 60000) / `WINEXEC_MAX_RESULT_BYTES` (default 524288, `0` disables spilling) / `WINEXEC_SPILL_KEEP` (default 20) / `WINEXEC_SPILL_KEEP_DAYS` (default 7) / `WINEXEC_PROBE_MS` (default 5000, liveness probe interval) / `WINEXEC_TOKEN` (HTTP token, kept out of the command line) / `WINEXEC_GITBASH` / `WINEXEC_DEBUG`.
 
 > **Stable service path (0.3.8+).** The exe always runs from `%LOCALAPPDATA%\win-exec-mcp\bin\win-exec-mcp.exe` (replaced in place on upgrades) — Windows Firewall and security suites remember network permissions per path, so a single allow survives upgrades and is never silently blocked. If the service becomes unreachable (a connection timeout means it is being blocked), run **`WinExec MCP: Fix firewall permissions (administrator)`** (it clears block rules, allows the stable path and kills leftovers after UAC confirmation), then reload the window. If a third-party security suite (360, Huorong, Tencent PC Manager, …) enforces its own network filter instead of Windows Firewall rules, add the stable path above to its trust/allow list (or exit it temporarily to verify).
 
