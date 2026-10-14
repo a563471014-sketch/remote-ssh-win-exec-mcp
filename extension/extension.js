@@ -286,9 +286,11 @@ function ensurePortsIgnore(...ports) {
     } catch (e) { }
 }
 
-// 远端窗口：自动启动 http MCP 连接（等价替用户按 Start；定义异步加载，多轮重试）
+// SSH 远端窗口：自动启动 http MCP 连接（等价替用户按 Start；定义异步加载，多轮重试）。
+// 仅限 SSH：http 入口端口（ssh.localPort）靠 SSH 隧道才存在；WSL 等远程（remoteName='wsl'）没有隧道，
+// 写了也连不上（WSL2 与 Windows 网络命名空间隔离）——那种场景只用 location:local 的 stdio 条目
 function autoStartHttpConnection() {
-    if (!vscode.env.remoteName) return;
+    if (!isSshRemote()) return;
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     if (!cfg.get('http.enabled', false)) return;
     [5000, 15000, 30000].forEach((delay) => {
@@ -621,7 +623,7 @@ async function enableExternalSetup(context) {
     // 直接执行一轮修复（外部配置已无开关：未 opt-out 即维护）
     ensureSshForward(context);
     const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
-    if (vscode.env.remoteName && folder) {
+    if (isSshRemote() && folder) {
         registerProject().catch(() => { });
     }
     // 开关变化触发 onDidChangeConfiguration → autoSetup：远端窗口随即追加 RemoteForward 并注册项目文件
@@ -754,7 +756,8 @@ function autoSetup(context) {
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     const optOut = context.globalState.get(EXTERNAL_OPTOUT_KEY, {}) || {};
     ensureUserMcp(context, cfg);
-    if (vscode.env.remoteName && cfg.get('http.enabled', false)) {
+    // HTTP 服务只在 SSH 隧道场景有意义（WSL 连不到 Windows 回环，见 autoStartHttpConnection 说明）
+    if (isSshRemote() && cfg.get('http.enabled', false)) {
         setTimeout(() => startHttp(context), 3000);
         // watchdog：服务被其他窗口关闭/崩溃时自动恢复（多窗口场景保证可用）
         if (watchdog) clearInterval(watchdog);
@@ -772,11 +775,11 @@ function autoSetup(context) {
     // 远端被 autoForward 误转发的端口是 RemoteForward 的入口端（ssh.localPort），不是 exe 的 http.port；
     // http.port 一并忽略是兜底：localPort 若配成与 exe 相同端口，转发监听会遮蔽 exe
     ensurePortsIgnore(cfg.get('ssh.localPort', 28848), cfg.get('http.port', 38848));
-    // 远端窗口自动注册到项目级 .vscode/mcp.json（“暂不”过则不动）
+    // SSH 远端窗口自动注册到项目级 .vscode/mcp.json（“暂不”过则不动）
     // 未打开项目（无工作区）时跳过——不报错；打开/添加项目后由 workspaceFolders 变化事件补注册
     // 无条件写条目（声明式配置：服务暂时不可用时 VS Code 会自行重试，服务恢复即可用）
     const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
-    if (!optOut.project && vscode.env.remoteName && folder) {
+    if (!optOut.project && isSshRemote() && folder) {
         setTimeout(() => registerProject().catch(() => { }), 4000);
     }
 }

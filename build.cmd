@@ -3,7 +3,7 @@ rem WinExec MCP pack: compile C -> refresh bundled files -> build vsix
 rem NOTE: bump VER together with extension\package.json version
 setlocal
 cd /d "%~dp0"
-set VER=0.5.0
+set VER=0.5.1
 rem 校验与 extension\package.json 一致（漏改会打出文件名/版本号错位的包）
 for /f %%v in ('powershell -NoProfile -Command "(Get-Content extension\package.json -Raw | ConvertFrom-Json).version"') do set PKGVER=%%v
 if not "%PKGVER%"=="%VER%" (echo [ERROR] VER=%VER% but extension\package.json=%PKGVER% & exit /b 1)
