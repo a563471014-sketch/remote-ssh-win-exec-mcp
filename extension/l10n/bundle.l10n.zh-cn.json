@@ -51,5 +51,10 @@
 	"Don't show again": "不再提示",
 	".mcp.json contains a Bearer token and this project looks like a git repository - consider adding .mcp.json to .gitignore or git update-index --skip-worktree": "项目根 .mcp.json 含 Bearer token，而本项目看起来是 git 仓库 —— 建议把 .mcp.json 加进 .gitignore，或 git update-index --skip-worktree",
 	"diagnostics written to the output channel": "诊断信息已写入输出通道",
-	"the bundled exe was updated but the running copy is locked; reload the window to switch to it": "内置 exe 已更新，但固定路径副本被运行中进程锁住；重载窗口后切换"
+	"the bundled exe was updated but the running copy is locked; reload the window to switch to it": "内置 exe 已更新，但固定路径副本被运行中进程锁住；重载窗口后切换",
+	"Copy HTTP token": "复制 HTTP token",
+	"HTTP token copied to the clipboard": "HTTP token 已复制到剪贴板",
+	"no token configured (leave http.token empty to auto-generate one)": "未配置 token（http.token 留空则首次激活自动生成）",
+	"Copy to clipboard": "复制到剪贴板",
+	"WinExec MCP tool call: {0}": "WinExec MCP 工具调用：{0}"
 }

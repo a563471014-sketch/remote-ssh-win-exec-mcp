@@ -13,7 +13,7 @@
 ### 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.5.4.vsix
+code --install-extension win-exec-mcp-0.6.0.vsix
 ```
 
 → **Reload Window** → 首次激活弹窗，按用途二选一：
@@ -50,7 +50,7 @@ code --install-extension win-exec-mcp-0.5.4.vsix
 - `WinExec MCP: 修复防火墙权限（管理员）` — 清除 win-exec 的防火墙阻止规则、放行固定路径并清理残留进程（UAC 确认；完成后重载窗口）
 - `WinExec MCP: 诊断` — 把版本/端口/probe 结果/mcp 注册状态/ssh 转发状态一次性落到输出通道，报障贴一段就够
 - `WinExec MCP: 重新生成 HTTP token` — 换 token 并同步全部已注册项目的 .mcp.json
-- **状态栏**：远端窗口显示服务健康（绿=运行/黄=启动中/红=不可用），点击出菜单（启停/诊断/修复/注册/token）
+- **状态栏**：远端窗口显示服务状态 —— 空闲=插头 / 启动中=旋转 / 有调用=闪电 / 正在输出=闪光（服务不可用时为红底）；**不显示任何数字、也不使用底色**（数字会被误读成 token 消耗，而底色切换在 modern-ui 下会推动相邻状态栏项），点击出菜单（启停/诊断/复制 token/修复/注册）
 
 ### 设置
 
@@ -67,7 +67,7 @@ UI text follows the VS Code display language (English / Simplified Chinese); no 
 ### Install and go
 
 ```
-code --install-extension win-exec-mcp-0.5.4.vsix
+code --install-extension win-exec-mcp-0.6.0.vsix
 ```
 
 → **Reload Window** → pick one of the two scopes in the consent dialog:
@@ -123,7 +123,7 @@ The extension only modifies files after you answer the consent dialog. Once auth
 - `WinExec MCP: Fix firewall permissions (administrator)` — clears win-exec firewall block rules, allows the stable path and kills leftover processes (UAC confirmation; reload afterwards)
 - `WinExec MCP: Diagnostics` — dumps version/port/probe results/mcp registrations/ssh forward status into the output channel in one shot
 - `WinExec MCP: Regenerate HTTP token` — rotates the token and resyncs all registered projects' .mcp.json
-- **Status bar**: remote windows show service health (green=running / yellow=starting / red=down); click for a menu (start/stop, diagnostics, repair, registration, token)
+- **Status bar**: the remote window shows service state - plug=idle / sync=starting / bolt=a tool call is in flight / sparkle=output is arriving (red background when the service is down). Deliberately **no numbers** (they read as token usage) and **no background colour** (switching it shifts neighbouring status bar items in modern-ui). Click for a menu (start/stop, diagnostics, token copy, repair, registration)
 
 ### Settings
 

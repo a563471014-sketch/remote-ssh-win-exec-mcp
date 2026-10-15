@@ -21,7 +21,12 @@ let autoToken = null;
 let watchdog = null; // 定时检查：服务被其他窗口关闭/崩溃时自动恢复
 let outChannel = null;
 let gContext = null; // activate 存下的 context（命令/事件回调里需要 globalState 时用）
-let statusItem = null; // 状态栏项
+let statusItem = null; // 状态栏项（健康 + 活动：单一项，用底色区分，不换图标不加项）
+let busyTool = ''; // 最近一次 [call] 的工具名（仅供 tooltip；状态栏文本里不出现文字/数字）
+let busyCount = 0; // 在飞的 tools/call 数（[call]/[done] 配对计数，并行调用不会被先回来的 [done] 提前清掉）
+let hot = false; // 每批输出翻转一次（zap ⇄ sparkle）；静默 400ms 后回到安静的闪电
+let hotTimer = null; // 回落定时器（每次 [act] 重置 ⇒ 密集输出时是常亮，不会被节流成顿闪）
+let sigStats = { call: 0, act: 0, done: 0 }; // 收到的信号计数（只进诊断输出，不写日志）
 let httpState = 'down'; // down | starting | live
 let staleExeWarned = false;
 
@@ -193,14 +198,11 @@ function ensureUserMcp(context, cfg) {
                 changed = true;
             }
         }
-    } else {
-        for (const k of containers) {
-            if (doc[k][STDIO_ID] && isOurEntry(STDIO_ID, doc[k][STDIO_ID])) {
-                delete doc[k][STDIO_ID];
-                changed = true;
-            }
-        }
     }
+    // 注意：**不**按窗口类型增删 stdio 条目 —— 用户级 mcp.json 是所有窗口共用的一份：
+    // 本地窗口写进去、SSH 窗口又删掉，同一文件来回拉锯 → 每次激活都 changed →
+    // 每次都弹"需重载窗口"。stdio 条目带 location:'local'，SSH 窗口本来就不用它
+    // （同名 server 由工作区 .mcp.json 的 http 条目覆盖），留着无害。
     for (const k of containers) {
         if (doc[k][HTTP_ID] && isOurEntry(HTTP_ID, doc[k][HTTP_ID])) {
             delete doc[k][HTTP_ID];
@@ -564,10 +566,16 @@ function startHttp(context) {
         // token 走环境变量而不是命令行：进程列表/任务管理器里看不到它（--token 仍兼容）
         child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WINEXEC_TOKEN: currentToken(cfg) } });
         setStatus('starting');
-        if (child.stdout) child.stdout.on('data', (d) => logMsg('http[out] ' + String(d).replace(/[\r\n]+$/, '')));
-        if (child.stderr) child.stderr.on('data', (d) => logMsg('http[err] ' + String(d).replace(/[\r\n]+$/, '')));
+        if (child.stderr) child.stderr.on('data', (d) => {
+            // 活动信号（[call]/[act]/[done]）只喂状态栏，刻意不写输出通道：忙起来每秒十几条会把日志刷爆。
+            // 同批里混着的其它 stderr（绑定失败/孤儿端口等诊断）仍照常记录。
+            const s = String(d);
+            handleActivitySignals(s);
+            const other = s.split('\n').filter((l) => l.trim() && !/^\[(call|act|done)\]/.test(l.trim()));
+            if (other.length) logMsg('http[err] ' + other.join(' | '));
+        });
         child.on('error', (err) => vscode.window.showErrorMessage(vscode.l10n.t('WinExec MCP failed to start: {0}', err.message)));
-        child.on('exit', (code) => { logMsg('http: service exited (code ' + code + ')'); child = null; });
+        child.on('exit', (code) => { logMsg('http: service exited (code ' + code + ')'); child = null; resetBusy(); refreshStatusBar(); });
         // 3 秒后复查：ok=正常；refused=进程没起来（退避重试）；timeout=回环被拦截（提示一键修复）
         setTimeout(() => {
             probePort(port, 1500).then((r) => {
@@ -589,6 +597,7 @@ function startHttp(context) {
 
 function stopHttp() {
     if (child) { child.kill(); child = null; }
+    resetBusy();
     setStatus('down');
 }
 
@@ -603,16 +612,23 @@ function refreshStatusBar() {
         if (gContext) gContext.subscriptions.push(statusItem);
     }
     const port = vscode.workspace.getConfiguration('winExecMcp').get('http.port', 38848);
+    // 实测（CDP 采样真实 DOM）：影响这一项宽度、进而推动相邻状态栏项的只有底色 ——
+    // ① 有/无底色切换：+6px；② 连底色与底色之间切换也会变（warningBackground 那相比 prominentBackground 宽 6px、
+    // 相邻项位置移 11px）。而等宽 codicon 之间来回换图标完全不动（连续 3 秒采样零位移）。
+    // 所以：底色一律不设（故障态除外），活动只用图标表达 —— 空闲 plug / 忙静默 zap / 有输出 sparkle。
+    statusItem.text = (httpState === 'starting'
+        ? '$(sync~spin)'
+        : (busyCount > 0 ? (hot ? '$(sparkle)' : '$(zap)') : '$(plug)')) + ' win-exec:' + port;
     if (httpState === 'live') {
-        statusItem.text = '$(plug) win-exec:' + port;
         statusItem.backgroundColor = undefined;
-        statusItem.tooltip = vscode.l10n.t('WinExec MCP service is running on port {0}', String(port));
+        statusItem.tooltip = busyCount > 0
+            ? vscode.l10n.t('WinExec MCP tool call: {0}', busyTool)
+            : vscode.l10n.t('WinExec MCP service is running on port {0}', String(port));
     } else if (httpState === 'starting') {
-        statusItem.text = '$(sync~spin) win-exec:' + port;
         statusItem.backgroundColor = undefined;
         statusItem.tooltip = vscode.l10n.t('WinExec MCP service is starting on port {0}', String(port));
     } else {
-        statusItem.text = '$(plug) win-exec:' + port;
+        // 故障很罕见但重要：保留红底（进出故障各一次宽度变化，可以接受）
         statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
         statusItem.tooltip = vscode.l10n.t('WinExec MCP service is down (port {0}); click the status bar item for actions', String(port));
     }
@@ -620,9 +636,47 @@ function refreshStatusBar() {
 }
 
 function setStatus(state) {
+    if (httpState !== state) logMsg('http state: ' + httpState + ' -> ' + state);
     httpState = state;
-    refreshStatusBar();
+    refreshStatusBar(); // 不动 busy 状态：watchdog/probe 每 15s 也走到这里，清掉会让进行中的调用指示中途消失
 }
+
+// —— 调用活动：exe 在 stderr 上发 [call] 工具名 / [act]（有输出）/ [done]。
+// 表现只用图标（不放数字、不用底色 —— 前者会被误读成 token 消耗，后者会推动相邻状态栏项）：
+//   忙 = 闪电常驻；每批输出翻转一次（zap ⇄ sparkle）= 跟数据同频闪；静默 400ms 回到安静的闪电。
+function handleActivitySignals(s) {
+    let hit = false;
+    let m;
+    const callRe = /\[call\]\s*(\S+)/g;
+    while ((m = callRe.exec(s))) { busyTool = m[1]; busyCount++; sigStats.call++; hit = true; }
+    if (s.indexOf('[act]') !== -1) {
+        // 每批输出翻一次：跟数据同频闪（exe 侧 100ms 节流 ⇒ 上限 10Hz），而不是“有输出就一直亮”
+        const n = (s.match(/\[act\]/g) || []).length;
+        for (let i = 0; i < n; i++) hot = !hot;
+        sigStats.act += n;
+        if (hotTimer) clearTimeout(hotTimer);
+        hotTimer = setTimeout(() => { hotTimer = null; hot = false; refreshStatusBar(); }, 400);
+        hit = true;
+    }
+    let done = 0;
+    const doneRe = /\[done\]/g;
+    while (doneRe.exec(s)) done++;
+    if (done) {
+        busyCount = Math.max(0, busyCount - done);
+        sigStats.done += done;
+        if (busyCount === 0) resetBusy();
+        hit = true;
+    }
+    if (hit) refreshStatusBar();
+}
+
+function resetBusy() {
+    busyCount = 0;
+    busyTool = '';
+    hot = false;
+    if (hotTimer) { clearTimeout(hotTimer); hotTimer = null; }
+}
+
 
 async function showWinExecMenu() {
     const t = (k) => vscode.l10n.t(k);
@@ -630,6 +684,7 @@ async function showWinExecMenu() {
     const items = [
         { label: '$(server-process) ' + t(running ? 'Stop HTTP service' : 'Start HTTP service'), act: () => (running ? stopHttp() : startHttp(gContext)) },
         { label: '$(info) ' + t('Diagnostics'), act: () => runDiagnostics().catch((e) => logMsg('diagnostics failed: ' + e.message)) },
+        { label: '$(copy) ' + t('Copy HTTP token'), act: () => copyToken() },
         { label: '$(shield) ' + t('Run repair (administrator)'), act: () => runFirewallFix(gContext) },
         { label: '$(output) ' + t('Open Output'), act: () => { if (outChannel) outChannel.show(); } },
         { label: '$(link) ' + t('Configure server-side agent (SSH forwarding + project registration)'), act: () => enableExternalSetup(gContext) },
@@ -653,9 +708,18 @@ async function regenerateToken() {
     vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('token regenerated; reopen each registered project to resync its .mcp.json'));
 }
 
+async function copyToken() {
+    const token = currentToken(vscode.workspace.getConfiguration('winExecMcp'));
+    if (!token) { vscode.window.showWarningMessage('WinExec MCP: ' + vscode.l10n.t('no token configured (leave http.token empty to auto-generate one)')); return; }
+    await vscode.env.clipboard.writeText(token);
+    vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('HTTP token copied to the clipboard'));
+}
+
 // —— 一键诊断：把排障需要的全部事实落到输出通道，报障贴一段就够 ——
+let diagLines = [];
 async function runDiagnostics() {
-    const L = (s) => logMsg('[diag] ' + s);
+    diagLines = [];
+    const L = (s) => { diagLines.push(s); logMsg('[diag] ' + s); };
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     const port = cfg.get('http.port', 38848);
     const exe = serviceExe(gContext);
@@ -666,6 +730,8 @@ async function runDiagnostics() {
     L('http: enabled=' + cfg.get('http.enabled', false) + ' port=' + port + ' host=' + (cfg.get('http.host', '') || '(127.0.0.1)'));
     L('port probe: ' + (await probePort(port, 1500)) + ', http probe: ' + (await probeOurHttp(port, 2000)));
     L('spawn fails: ' + httpSpawnFails + ', state: ' + httpState);
+    L('child: ' + (child ? ('pid=' + child.pid + ' alive=' + (child.exitCode === null)) : 'none') + ', statusItem=' + (statusItem ? 'created' : 'null'));
+    L('activity (ui v3: icon+always-on background): in-flight=' + busyCount + ', tool=' + (busyTool || '-') + ', hot=' + hot + ', signals: call=' + sigStats.call + ' act=' + sigStats.act + ' done=' + sigStats.done);
     try {
         const doc = JSON.parse(fs.readFileSync(userMcpPath(gContext), 'utf8'));
         const has = ['servers', 'mcpServers'].some((k) => doc[k] && doc[k][STDIO_ID]);
@@ -675,7 +741,9 @@ async function runDiagnostics() {
     L('ssh forward: ' + sshForwardStatus(cfg));
     L('--- diagnostics end ---');
     if (outChannel) outChannel.show();
-    vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('diagnostics written to the output channel'));
+    const copyLabel = vscode.l10n.t('Copy to clipboard');
+    vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('diagnostics written to the output channel'), copyLabel)
+        .then((pick) => { if (pick === copyLabel) vscode.env.clipboard.writeText(diagLines.join('\n')); });
 }
 
 // 回环连接超时 = 本机防火墙/安全软件把该程序的入站连接静默丢弃的典型特征（连 127.0.0.1 都连不上）。
@@ -897,7 +965,7 @@ function activate(context) {
     gContext = context;
     outChannel = vscode.window.createOutputChannel('WinExec MCP');
     context.subscriptions.push(outChannel);
-    logMsg('activate v' + context.extension.packageJSON.version + (vscode.env.remoteName ? ' remote=' + vscode.env.remoteName : ' local'));
+    logMsg('activate v' + context.extension.packageJSON.version + (vscode.env.remoteName ? ' remote=' + vscode.env.remoteName : ' local') + ' pid=' + process.pid + ' ui=v5 (icons only, data-driven blink)');
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     // 迁移：0.3.5 起移除 ssh.autoForward / project.autoRegister 两个设置，
     // 曾显式设为 false 的转为内部“不启用”记录（避免把用户主动关过的功能又静默打开）
@@ -938,6 +1006,7 @@ function activate(context) {
         vscode.commands.registerCommand('winExecMcp.menu', () => showWinExecMenu()),
         vscode.commands.registerCommand('winExecMcp.diagnostics', () => runDiagnostics().catch((e) => logMsg('diagnostics failed: ' + e.message))),
         vscode.commands.registerCommand('winExecMcp.regenerateToken', () => regenerateToken().catch((e) => logMsg('token regen failed: ' + e.message))),
+        vscode.commands.registerCommand('winExecMcp.copyToken', () => copyToken()),
         vscode.commands.registerCommand('winExecMcp.setup', async () => {
             if (await askConsent(context)) autoSetup(context);
         })

@@ -51,5 +51,10 @@
 	"Don't show again": "Don't show again",
 	".mcp.json contains a Bearer token and this project looks like a git repository - consider adding .mcp.json to .gitignore or git update-index --skip-worktree": ".mcp.json contains a Bearer token and this project looks like a git repository - consider adding .mcp.json to .gitignore or git update-index --skip-worktree",
 	"diagnostics written to the output channel": "diagnostics written to the output channel",
-	"the bundled exe was updated but the running copy is locked; reload the window to switch to it": "the bundled exe was updated but the running copy is locked; reload the window to switch to it"
+	"the bundled exe was updated but the running copy is locked; reload the window to switch to it": "the bundled exe was updated but the running copy is locked; reload the window to switch to it",
+	"Copy HTTP token": "Copy HTTP token",
+	"HTTP token copied to the clipboard": "HTTP token copied to the clipboard",
+	"no token configured (leave http.token empty to auto-generate one)": "no token configured (leave http.token empty to auto-generate one)",
+	"Copy to clipboard": "Copy to clipboard",
+	"WinExec MCP tool call: {0}": "WinExec MCP tool call: {0}"
 }

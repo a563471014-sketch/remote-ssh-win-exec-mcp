@@ -21,9 +21,9 @@ Remote-SSH 场景里 agent 跑在 Linux，但很多东西只存在于 Windows �
 
 | 工具 | 参数 | 返回 |
 |---|---|---|
-| `windows_exec` | `command`（必填，cmd 语法，支持 `&&` / 管道）、`timeout_ms`（默认 30000，上限 24h）、`cwd`（工作目录，可选）、`shell`（`cmd` 默认 / `gitbash` / `powershell`——pwsh 7 优先、自动回退 5.1）、`env`（可选，`{"KEY":"VAL"}` 叠加环境变量，`null` 删除）、`stdin`（可选，文本喂给子进程 stdin） | `[exit: N]` + stdout/stderr（UTF-8，逐行判定编码）；结构化字段在 `structuredContent`：`exitCode`/`timedOut`/`cancelled`/`outputTruncated`/`spillPath` 等 |
-| `windows_fs_put` | `path`（必填，Windows 绝对路径，父目录自动创建）、`content` 或 `content_base64`（二选一，文本/base64）、`offset`（可选，默认 0=创建/覆盖；>0 分块续传） | 写入确认；`structuredContent`：`path`/`bytesWritten`/`offset`/`size` |
-| `windows_fs_get` | `path`（必填）、`offset`/`length`（可选，单次上限 4MB）、`as`（`base64` 默认（无损）/`text`（编码探测）） | 文件内容（base64 或文本）；`structuredContent`：`path`/`size`/`offset`/`bytesRead`/`eof`/`as` |
+| `windows_exec` | `command`（必填，cmd 语法，支持 `&&` / 管道）、`timeout_ms`（默认 30000，上限 24h）、`cwd`（工作目录，可选）、`shell`（`cmd` 默认 / `gitbash` / `powershell`——pwsh 7 优先、自动回退 5.1）、`env`（可选，`{"KEY":"VAL"}` 叠加环境变量，`null` 删除）、`stdin`（可选，文本喂给子进程 stdin） | 首行机器可读哨兵 `[exit-json: {"code":0,"ms":625,"shell":"pwsh","timedOut":false,"cancelled":false,"clientGone":false,"spawnError":false,"spilled":false,"log":null}]`（`code` 在超时/取消/断连/spawn 失败时为 `null`；旧前缀 `[exit: N \| 耗时ms]` 跟在同一行后面，兼容既有解析）+ 正文 stdout/stderr（UTF-8，逐行判定编码） |
+| `windows_fs_put` | `path`（必填，Windows 绝对路径，父目录自动创建）、`content` 或 `content_base64`（二选一，文本/base64）、`offset`（可选，默认 0=创建/覆盖；>0 分块续传） | 写入确认；结构化字段：`path`/`bytesWritten`/`offset`/`size` |
+| `windows_fs_get` | `path`（必填）、`offset`/`length`（可选，单次上限 4MB）、`as`（`base64` 默认（无损）/`text`（编码探测）） | 文件内容（base64 或文本）+ 元数据行 `[win-exec meta]`：`path`/`size`/`offset`/`bytesRead`/`eof`/`as` |
 | `windows_bg_start` | `command`（必填）、`shell`/`cwd`/`env`（可选） | `jobId`/`pid`/`logPath`；完整输出落盘 |
 | `windows_bg_poll` | `job_id`（必填）、`wait_ms`（可选 0–30000 长轮询）、`max_bytes`（可选，默认 64KB） | 增量输出（`content`）+ `{running, exitCode, killed, unreadBytes, logPath, elapsedMs}` |
 | `windows_bg_kill` | `job_id`（必填） | 终止整棵进程树 |
@@ -100,7 +100,7 @@ SSH RemoteForward（`winExecMcp.ssh.localPort`，默认 28848 → Windows `127.0
 - `WinExec MCP: 注册到本项目 / 从本项目移除注册`（项目级 http；默认 SSH 隧道 URL，设置 `http.host` 后为局域网 IP）
 - `WinExec MCP: Start / Stop HTTP service`
 - `WinExec MCP: 修复防火墙权限（管理员）`（清除 win-exec 防火墙阻止规则 + 放行固定路径；UAC 确认后重载）
-- `WinExec MCP: 诊断` / `重新生成 HTTP token`；远端窗口状态栏显示服务健康，点击出操作菜单
+- `WinExec MCP: 诊断` / `重新生成 HTTP token`；远端窗口状态栏显示服务状态与调用活动（空闲/启动/调用中/正在输出四种图标，不用数字也不改底色），点击出操作菜单
 
 ### 源码结构
 
@@ -140,9 +140,9 @@ returns over the MCP channel (optionally through the SSH encrypted tunnel).
 
 | tool | params | returns |
 |---|---|---|
-| `windows_exec` | `command` (required, cmd syntax, `&&` / pipes ok), `timeout_ms` (default 30000, max 24h), `cwd` (working directory, optional), `shell` (`cmd` default / `gitbash` / `powershell` — pwsh 7 preferred, auto-falls back to 5.1), `env` (optional `{"KEY":"VAL"}` overlay; `null` removes), `stdin` (optional text fed to the child's stdin) | `[exit: N]` + stdout/stderr (UTF-8, per-line encoding detection); structured fields in `structuredContent`: `exitCode`/`timedOut`/`cancelled`/`outputTruncated`/`spillPath` … |
-| `windows_fs_put` | `path` (required, Windows absolute path, parent dirs auto-created), `content` or `content_base64` (one of, text/base64), `offset` (optional, default 0 = create/overwrite; >0 for chunked upload) | write ack; `structuredContent`: `path`/`bytesWritten`/`offset`/`size` |
-| `windows_fs_get` | `path` (required), `offset`/`length` (optional, ≤4MB per call), `as` (`base64` default (lossless) / `text` (encoding detection)) | file content (base64 or text); `structuredContent`: `path`/`size`/`offset`/`bytesRead`/`eof`/`as` |
+| `windows_exec` | `command` (required, cmd syntax, `&&` / pipes ok), `timeout_ms` (default 30000, max 24h), `cwd` (working directory, optional), `shell` (`cmd` default / `gitbash` / `powershell` — pwsh 7 preferred, auto-falls back to 5.1), `env` (optional `{\"KEY\":\"VAL\"}` overlay; `null` removes), `stdin` (optional text fed to the child's stdin) | first line is a machine-readable sentinel `[exit-json: {"code":0,"ms":625,"shell":"pwsh","timedOut":false,"cancelled":false,"clientGone":false,"spawnError":false,"spilled":false,"log":null}]` (`code` is `null` on timeout/cancel/disconnect/spawn failure; the legacy prefix `[exit: N \| duration ms]` follows on the same line for compatibility) + body stdout/stderr (UTF-8, per-line encoding detection) |
+| `windows_fs_put` | `path` (required, Windows absolute path, parent dirs auto-created), `content` or `content_base64` (one of, text/base64), `offset` (optional, default 0 = create/overwrite; >0 for chunked upload) | write ack; structured fields: `path`/`bytesWritten`/`offset`/`size` |
+| `windows_fs_get` | `path` (required), `offset`/`length` (optional, ≤4MB per call), `as` (`base64` default (lossless) / `text` (encoding detection)) | file content (base64 or text) + metadata line `[win-exec meta]`: `path`/`size`/`offset`/`bytesRead`/`eof`/`as` |
 | `windows_bg_start` | `command` (required), `shell`/`cwd`/`env` (optional) | `jobId`/`pid`/`logPath`; full output spilled to disk |
 | `windows_bg_poll` | `job_id` (required), `wait_ms` (optional 0–30000 long-poll), `max_bytes` (optional, 64KB default) | incremental output (`content`) + `{running, exitCode, killed, unreadBytes, logPath, elapsedMs}` |
 | `windows_bg_kill` | `job_id` (required) | terminates the whole process tree |

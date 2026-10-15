@@ -407,6 +407,7 @@ static __thread int    g_ptok_num = 0;    /* token 是数字型 */
 static __thread double g_ptok_numval = 0; /* 数字型 token 的值 */
 static __thread int    g_pseq = 0;        /* progress 递增序号 */
 static __thread DWORD  g_p_last_ms = 0;   /* 上次发送时间（限流 ~10/s） */
+static __thread DWORD  g_act_last_ms = 0; /* 上次 [act] 输出活动信号时间（100ms 节流） */
 static __thread DWORD  g_p_partial_ms = 0;/* 上次补发部分行的时间 */
 static __thread int    g_streaming = 0;   /* HTTP：本次响应已开始 SSE 流式 */
 static __thread SOCKET g_stream_sock = 0; /* HTTP：流式响应所用连接 */
@@ -656,6 +657,17 @@ static char *build_progress_msg(const char *raw, int rstart, int rend, int budge
 /* run_cmd 每读到一段输出后调用：把 [*emitted, olen) 内"最后一个换行前"的新内容发出去。
    force=1（命令结束）时无换行也发、无视限流。窗口内只保留完整行，跳过/折叠均有标注。 */
 static void progress_scan(const char *out, int olen, int *emitted, int force) {
+    /* 输出活动信号（与 progressToken 无关）：扩展据此把状态栏图标“点亮”（闪电 + 蓝底），
+       250ms 无新输出自动回落成空心。100ms 节流 ⇒ 密集输出时是常亮、间歇输出时跟着数据闪；
+       静默期不发 ⇒ 保持空心（一眼看出没有输出） */
+    if (g_http_mode && olen > *emitted) {
+        DWORD anow = GetTickCount();
+        if (anow - g_act_last_ms >= 100) {
+            g_act_last_ms = anow;
+            fprintf(stderr, "[act]\n");
+            fflush(stderr);
+        }
+    }
     if (!progress_on() || olen <= *emitted) return;
     int end;
     if (force) {
@@ -873,6 +885,68 @@ static char *spill_result(const char *text, const char *prefix, char **path_out)
     return out;
 }
 
+/* ---- 回传体收缩（tail_lines）----
+   只作用于“回传”的那一份；流式显示（progress）是另一条路，始终全量。
+   与 Linux 侧 server.py 的 _tail_keep_spill_hint 同语义。 */
+
+/* 复制 [p, p+len) 为独立字符串（失败返回 NULL） */
+static char *dup_range(const char *p, size_t len) {
+    char *s = (char *)malloc(len + 1);
+    if (!s) return NULL;
+    memcpy(s, p, len);
+    s[len] = '\0';
+    return s;
+}
+
+/* 摘出“完整日志已存盘”那一行（无则 NULL） */
+static char *spill_hint_line(const char *spill_text) {
+    const char *h = strstr(spill_text, "完整日志已存盘");
+    const char *s, *e;
+    if (!h) return NULL;
+    s = h; e = h;
+    while (s > spill_text && s[-1] != '\n') s--;
+    while (*e && *e != '\n') e++;
+    return dup_range(s, (size_t)(e - s));
+}
+
+/* 只保留末尾 n 行（行数没超 n 则返回 NULL，调用方保持原文）。
+   首行 [exit: ...] 前缀与 hint_line（落盘提示）始终保留 —— 截尾不能把线索截掉。 */
+static char *tail_last_lines(const char *text, int n, const char *hint_line) {
+    const char *nl, *body, *p, *ts;
+    unsigned total = 1, i;
+    int seen = 0, w = 0;
+    size_t hl, tl, hlen;
+    char *out;
+    if (n <= 0) return NULL;
+    nl = strchr(text, '\n');
+    body = nl ? nl + 1 : text + strlen(text);
+    for (i = 0; body[i]; i++) if (body[i] == '\n') total++;
+    if ((int)total <= n) return NULL;
+    p = body + strlen(body);
+    ts = body;
+    while (p > body) {
+        p--;
+        if (*p == '\n' && ++seen > n) { ts = p + 1; break; }
+    }
+    hl = (size_t)(body - text);                    /* 前缀行（含换行） */
+    tl = strlen(ts);
+    hlen = hint_line ? strlen(hint_line) + 1 : 0;
+    out = (char *)malloc(hl + hlen + tl + 128);
+    if (!out) return NULL;
+    memcpy(out, text, hl);
+    w = (int)hl;
+    if (hlen) {
+        int l = (int)(hlen - 1);
+        memcpy(out + w, hint_line, l);
+        w += l;
+        out[w++] = '\n';
+    }
+    w += sprintf(out + w, "... (truncated, last %d of %u lines) ...\n", n, total);
+    memcpy(out + w, ts, tl);
+    out[w + (int)tl] = '\0';
+    return out;
+}
+
 /* ============ 执行 Windows 命令（CreateProcess + 管道 + 超时） ============ */
 typedef struct {
     char *output;   /* UTF-8 文本 */
@@ -885,6 +959,54 @@ typedef struct {
 } RunResult;
 
 #define MAX_OUTPUT (16 * 1024 * 1024) /* 内存缓冲上限；超出后改为边跑边写落盘文件，不再丢弃（仍需继续排空管道，防止子进程写满管道阻塞） */
+
+/* 首行机器可读哨兵：所有结束路径（正常/超时/取消/断连/spawn 失败/落盘）共用同一 schema，
+   下游不必再用正则猜；旧的文本前缀按原样跟在同一行后面，过渡期兼容既有解析。 */
+static void json_escape_path(const char *src, char *dst, size_t cap) {
+    size_t w = 0;
+    if (!src) { if (cap >= 5) strcpy(dst, "null"); else if (cap) dst[0] = 0; return; }
+    if (cap < 3) { if (cap) dst[0] = 0; return; }
+    dst[w++] = '"';
+    for (const char *p = src; *p && w + 3 < cap; p++) {
+        if (*p == '\\' || *p == '"') dst[w++] = '\\';
+        dst[w++] = *p;
+    }
+    dst[w++] = '"';
+    dst[w] = 0;
+}
+
+static char *exit_json_line(const RunResult *rr, unsigned long dur, const char *shell_id, const char *prefix) {
+    char code[24], log[2100];
+    if (rr->spawn_err || rr->timed_out || rr->aborted) strcpy(code, "null");
+    else sprintf(code, "%d", rr->exit_code);
+    json_escape_path(rr->spill_path, log, sizeof(log));
+    size_t cap = strlen(prefix) + strlen(log) + 320;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    snprintf(out, cap,
+        "[exit-json: {\"code\":%s,\"ms\":%lu,\"shell\":\"%s\",\"timedOut\":%s,\"cancelled\":%s,"
+        "\"clientGone\":%s,\"spawnError\":%s,\"spilled\":%s,\"log\":%s}] %s",
+        code, dur, shell_id,
+        rr->timed_out ? "true" : "false",
+        rr->aborted == 1 ? "true" : "false",
+        rr->aborted == 2 ? "true" : "false",
+        rr->spawn_err ? "true" : "false",
+        rr->spill_path ? "true" : "false",
+        log, prefix);
+    return out;
+}
+
+/* 把 text 的第一行换成 line1（其余字节原样保留，**含原首行末尾的换行**）；失败返回 NULL，调用方保持原文 */
+static char *replace_first_line(char *text, const char *line1) {
+    const char *nl = strchr(text, '\n');
+    const char *rest = nl ? nl : "";
+    size_t l1 = strlen(line1), rl = strlen(rest);
+    char *out = (char *)malloc(l1 + rl + 1);
+    if (!out) return NULL;
+    memcpy(out, line1, l1);
+    memcpy(out + l1, rest, rl + 1);
+    return out;
+}
 
 /* 追加数据到输出缓冲，超出 MAX_OUTPUT 的部分丢弃（仅在落盘失败的回退路径上会发生） */
 static void out_append(char **out, int *olen, int *ocap, const char *buf, int rd, int *truncated) {
@@ -1871,15 +1993,12 @@ static void handle_fs_get(Json *id, Json *args) {
     Json *res = j_obj();
     Json *c = j_arr();
     j_add(c, j_text(content));
+    /* 元数据用独立 content 块：不能用 structuredContent（VS Code 会丢掉数据块，见 windows_exec 处注释） */
+    char meta[320];
+    snprintf(meta, sizeof(meta), "[win-exec meta] path=%s size=%lld offset=%lld bytesRead=%lu eof=%s as=%s",
+             path, sz.QuadPart, offset, (unsigned long)got, eof ? "true" : "false", as_text ? "text" : "base64");
+    j_add(c, j_text(meta));
     j_set(res, "content", c);
-    Json *sc = j_obj();
-    j_set(sc, "path", j_str(path));
-    j_set(sc, "size", j_num((double)sz.QuadPart));
-    j_set(sc, "offset", j_num((double)offset));
-    j_set(sc, "bytesRead", j_num((double)got));
-    j_set(sc, "eof", j_bool(eof));
-    j_set(sc, "as", j_str(as_text ? "text" : "base64"));
-    j_set(res, "structuredContent", sc);
     send_json(resp_result(id, res));
     free(content);
     free(wp);
@@ -2016,6 +2135,35 @@ static void handle_windows_env(Json *id) {
         j_set(tools_obj, tool_names[i], j_str(fp));
     }
 
+    /* WSL 检测：agent 摸底后才知道跨文件系统代价（mnt 路径 I/O 慢两个数量级，重活该进 WSL 原生跑）。
+       不解析 wsl.exe 输出（UTF-16LE，C 字符串遇 0x00 截断）——直接读注册表 Lxss，每个发行版一个子键 */
+    char wsl_exe[256]; wsl_exe[0] = 0;
+    char wsl_names[256]; wsl_names[0] = 0;
+    {
+        char fp[MAX_PATH];
+        if (SearchPathA(NULL, "wsl.exe", NULL, MAX_PATH, fp, NULL)) {
+            strcpy(wsl_exe, fp);
+            HKEY k;
+            if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Lxss", 0, KEY_READ, &k) == ERROR_SUCCESS) {
+                char sub[64];
+                DWORD i = 0;
+                for (;;) {
+                    DWORD sn = sizeof(sub);
+                    if (RegEnumKeyExA(k, i++, sub, &sn, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+                    char path[160];
+                    snprintf(path, sizeof(path), "Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\%s", sub);
+                    char dn[128];
+                    reg_query_str(HKEY_CURRENT_USER, path, "DistributionName", dn, sizeof(dn));
+                    if (dn[0] && strlen(wsl_names) < sizeof(wsl_names) - 3) {
+                        if (wsl_names[0]) strncat(wsl_names, ", ", sizeof(wsl_names) - strlen(wsl_names) - 1);
+                        strncat(wsl_names, dn, sizeof(wsl_names) - strlen(wsl_names) - 1);
+                    }
+                }
+                RegCloseKey(k);
+            }
+        }
+    }
+
     char text[8192];
     snprintf(text, sizeof(text),
         "[windows_env]\n"
@@ -2027,6 +2175,7 @@ static void handle_windows_env(Json *id) {
         "tools: %s\n"
         "COM ports: %s\n"
         "disks: %s\n"
+        "WSL: %s\n"
         "proxy: %s\n"
         "TEMP: %s\n"
         "CWD: %s\n",
@@ -2038,6 +2187,7 @@ static void handle_windows_env(Json *id) {
         tools_line[0] ? tools_line : "(none)",
         coms[0] ? coms : "(none)",
         disks[0] ? disks : "(none)",
+        wsl_exe[0] ? (wsl_names[0] ? wsl_names : "(installed, no distros)") : "(not installed)",
         proxy[0] ? proxy : "(none)",
         temp, cwd8 ? cwd8 : "?");
 
@@ -2059,6 +2209,8 @@ static void handle_windows_env(Json *id) {
     j_set(sc, "tools", tools_obj);
     j_set(sc, "comPorts", com_arr);
     j_set(sc, "disks", disk_arr);
+    j_set(sc, "wslExe", j_str(wsl_exe));
+    j_set(sc, "wslDistros", j_str(wsl_names));
     j_set(sc, "proxy", j_str(proxy));
     j_set(sc, "temp", j_str(temp));
     j_set(sc, "cwd", j_str(cwd8 ? cwd8 : ""));
@@ -2409,18 +2561,13 @@ static void handle_bg_poll(Json *id, Json *args) {
     Json *res = j_obj();
     Json *c = j_arr();
     j_add(c, j_text(text ? text : ""));
+    /* 状态行用独立 content 块：不能用 structuredContent（VS Code 会丢掉输出文本，见 windows_exec 处注释） */
+    char meta[512];
+    snprintf(meta, sizeof(meta), "[bg] jobId=%s running=%s exitCode=%lu killed=%s newBytes=%lld totalBytes=%lld unreadBytes=%lld elapsedMs=%lu\n  log: %s",
+             job_id, running ? "true" : "false", (unsigned long)exit_code, killed ? "true" : "false",
+             got, total, total - sent_after, (unsigned long)elapsed, logcopy);
+    j_add(c, j_text(meta));
     j_set(res, "content", c);
-    Json *sc = j_obj();
-    j_set(sc, "jobId", j_str(job_id));
-    j_set(sc, "running", j_bool(running));
-    j_set(sc, "exitCode", j_num((double)exit_code));
-    j_set(sc, "killed", j_bool(killed));
-    j_set(sc, "newBytes", j_num((double)got));
-    j_set(sc, "totalBytes", j_num((double)total));
-    j_set(sc, "unreadBytes", j_num((double)(total - sent_after)));
-    j_set(sc, "logPath", j_str(logcopy));
-    j_set(sc, "elapsedMs", j_num((double)elapsed));
-    j_set(res, "structuredContent", sc);
     send_json(resp_result(id, res));
     free(text);
 }
@@ -2510,6 +2657,12 @@ static void handle_tools_call(Json *id, Json *params) {
 
     progress_begin(params); /* 客户端带 progressToken 时启用自动流式输出 */
 
+    /* 调用信号灯：扩展捕获 stderr 里这行驱动活动指示（不进 stdout 避免污染协议；仅 HTTP 模式发，同 [done]） */
+    if (tool[0] && g_http_mode) {
+        fprintf(stderr, "[call] %s\n", tool);
+        fflush(stderr);
+    }
+
     if (strcmp(tool, "windows_exec") == 0) {
         const char *command = "";
         int timeout_ms = 30000;
@@ -2518,6 +2671,7 @@ static void handle_tools_call(Json *id, Json *params) {
         Json *env_obj = NULL;
         const char *stdin_data = NULL;
         int stdin_len = 0;
+        int tail_lines = 0;
         if (args) {
             Json *c = j_get(args, "command");
             if (c && c->type == 2) command = c->str;
@@ -2538,6 +2692,10 @@ static void handle_tools_call(Json *id, Json *params) {
                 stdin_data = sd->str;
                 stdin_len = (int)strlen(sd->str);
             }
+            Json *tl = j_get(args, "tail_lines");
+            if (tl && tl->type == 3) tail_lines = (int)tl->num;
+            else if (tl && tl->type == 2) tail_lines = atoi(tl->str);
+            if (tail_lines < 0) tail_lines = 0;
         }
         /* cwd 必须是存在的目录（UTF-8 → W 校验，避免中文路径被 ANSI 误判） */
         if (cwd) {
@@ -2640,6 +2798,7 @@ static void handle_tools_call(Json *id, Json *params) {
             progress_emit(head);
             g_p_last_ms = GetTickCount();
         }
+        DWORD t0 = GetTickCount();
         RunResult rr = use_bash ? run_bash_cmd(command, timeout_ms, cwd, env_block, stdin_data, stdin_len)
                       : use_ps  ? run_ps_cmd(command, timeout_ms, cwd, env_block, stdin_data, stdin_len)
                       :           run_cmd(command, timeout_ms, cwd, env_block, stdin_data, stdin_len);
@@ -2648,33 +2807,51 @@ static void handle_tools_call(Json *id, Json *params) {
         const char *shmark = use_bash ? " [shell: gitbash]"
                             : use_ps ? (g_pwsh_path[0] ? " [shell: pwsh]" : " [shell: powershell]")
                             : "";
+        unsigned long dur = (unsigned long)(GetTickCount() - t0);
         if (rr.spawn_err) sprintf(prefix, "[spawn error]%s", shmark);
-        else if (rr.aborted == 1) sprintf(prefix, "[exit: cancelled（命令已被调用方取消，进程树已终止）]%s", shmark);
-        else if (rr.aborted == 2) sprintf(prefix, "[exit: client-disconnected（客户端断开，进程树已终止）]%s", shmark);
-        else if (rr.timed_out) sprintf(prefix, "[exit: timeout(%dms) 命令超时被终止]%s", timeout_ms, shmark);
-        else sprintf(prefix, "[exit: %d]%s", rr.exit_code, shmark);
+        else if (rr.aborted == 1) sprintf(prefix, "[exit: cancelled（命令已被调用方取消，进程树已终止）| %lu ms]%s", dur, shmark);
+        else if (rr.aborted == 2) sprintf(prefix, "[exit: client-disconnected（客户端断开，进程树已终止）| %lu ms]%s", dur, shmark);
+        else if (rr.timed_out) sprintf(prefix, "[exit: timeout(%dms 上限，实际 %lu ms) 命令超时被终止]%s", timeout_ms, dur, shmark);
+        else sprintf(prefix, "[exit: %d | %lu ms]%s", rr.exit_code, dur, shmark);
         char *text = (char *)malloc(strlen(prefix) + (rr.output ? strlen(rr.output) : 0) + 16);
         sprintf(text, "%s\n%s", prefix, rr.output ? rr.output : "");
-        /* 超大结果：全文落盘，只回传"标注 + 尾部"（防 MB 级结果灌满模型上下文与客户端渲染） */
+        /* 超大结果：全文落盘（保留全量，事后可查），回传体下面再收缩 */
+        char *spill_repl = NULL;
         if (g_spill_bytes > 0 && (int)strlen(text) > g_spill_bytes) {
-            char *sp = spill_result(text, prefix, &rr.spill_path);
-            if (sp) { free(text); text = sp; }
+            spill_repl = spill_result(text, prefix, &rr.spill_path);
+        }
+        /* 调用方指定 tail_lines：只回传末尾 N 行（缺省 0 = 全给）。
+           落的盘仍是全量；progress 通道不受影响（执行中已实时全量推送）。
+           落盘提示行在 spill_repl 里（原文没有），摘出来交给 tail_last_lines 保住，
+           否则截尾会把“日志在哪”这条线索一起截掉。 */
+        if (tail_lines > 0) {
+            char *hint = spill_repl ? spill_hint_line(spill_repl) : NULL;
+            char *t = tail_last_lines(text, tail_lines, hint);
+            if (hint) free(hint);
+            if (t) { free(text); text = t; }
+            if (spill_repl) { free(spill_repl); spill_repl = NULL; }
+        } else if (spill_repl) {
+            free(text);
+            text = spill_repl;
+            spill_repl = NULL;
+        }
+        /* 首行换成机器可读的 JSON 哨兵（旧文本前缀保留在同一行后面，兼容既有解析）。
+           放最后做：此时 spill 与 tail_lines 都已定型（spilled/log 字段要准）。 */
+        {
+            const char *shell_id = use_bash ? "gitbash" : use_ps ? (g_pwsh_path[0] ? "pwsh" : "powershell") : "cmd";
+            char *json_line = exit_json_line(&rr, dur, shell_id, prefix);
+            if (json_line) {
+                char *nt = replace_first_line(text, json_line);
+                free(json_line);
+                if (nt) { free(text); text = nt; }
+            }
         }
         Json *r = j_obj();
         Json *c = j_arr();
         j_add(c, j_text(text));
         j_set(r, "content", c);
-        /* 结构化结果（MCP 2025-06-18）：客户端/agent 可直接取字段，不必从文本里抠 [exit: N] */
-        Json *sc = j_obj();
-        j_set(sc, "exitCode", j_num((double)rr.exit_code));
-        j_set(sc, "shell", j_str(use_bash ? "gitbash" : use_ps ? (g_pwsh_path[0] ? "pwsh" : "powershell") : "cmd"));
-        j_set(sc, "timedOut", j_bool(rr.timed_out ? 1 : 0));
-        j_set(sc, "cancelled", j_bool(rr.aborted == 1 ? 1 : 0));
-        j_set(sc, "clientGone", j_bool(rr.aborted == 2 ? 1 : 0));
-        j_set(sc, "spawnError", j_bool(rr.spawn_err ? 1 : 0));
-        j_set(sc, "outputTruncated", j_bool(rr.truncated ? 1 : 0));
-        if (rr.spill_path) j_set(sc, "spillPath", j_str(rr.spill_path));
-        j_set(r, "structuredContent", sc);
+        /* 不带 structuredContent：VS Code 对带它的结果只把 JSON 喂给模型、丢弃文本（stdout 会全部丢失）。
+           元数据已全部在文本前缀里（退出码/耗时/超时/取消/spillPath 标注） */
         send_json(resp_result(id, r));
         free(text);
         free(rr.output);
@@ -2699,6 +2876,14 @@ static void handle_tools_call(Json *id, Json *params) {
     send_json(resp_result(id, r));
 }
 
+/* MCP 标准 annotations：告知客户端工具的只读/破坏性，UI 可据此免确认或加警告 */
+static Json *tool_ann(int ro, int dest) {
+    Json *a = j_obj();
+    j_set(a, "readOnlyHint", j_bool(ro));
+    j_set(a, "destructiveHint", j_bool(dest));
+    return a;
+}
+
 static void handle_message(const char *line) {
     Json *msg = json_parse(line);
     if (!msg || msg->type != 0) { if (msg) j_free(msg); return; }
@@ -2720,13 +2905,17 @@ static void handle_message(const char *line) {
         j_set(info, "name", j_str("win-exec-mcp"));
         j_set(info, "version", j_str(WINEXEC_VERSION));
         j_set(r, "serverInfo", info);
-        char instr[1400];
+        char instr[2400];
         snprintf(instr, sizeof(instr),
             "windows_exec 在 Windows 主机上执行命令：默认 cmd 语法（shell 另有 gitbash / powershell；env 可叠加环境变量；stdin 可喂输入）。%s"
             "长命令的输出会以 progress 通知实时推送，最终结果包含完整输出与退出码。"
             "文件互传用 windows_fs_put / windows_fs_get（二进制走 base64；单次 ≤4MB，大文件按 offset 分块）。"
             "长驻进程用 windows_bg_start / windows_bg_poll / windows_bg_kill / windows_bg_list（起任务拿 job_id，poll 增量取输出）。"
-            "环境摸底（OS/工具链/串口/磁盘）用 windows_env。",
+            "环境摸底（OS/工具链/串口/磁盘/WSL）用 windows_env。"
+            "经验法则：①预计超过 ~1 分钟的命令（安装/编译/长测试）改用 windows_bg_start + windows_bg_poll 循环（wait_ms 建议 10000-30000，直到 running=false）；"
+            "②输出超过 512KB 时结果只含尾部与 spillPath，需要完整内容用 windows_fs_get 读该文件；"
+            "③长命令给足 timeout_ms（默认仅 30 秒，超时会杀整棵进程树）；"
+            "④结果首行是机器可读哨兵 [exit-json: {\"code\":0,\"ms\":625,\"shell\":\"pwsh\",\"timedOut\":false,\"cancelled\":false,\"clientGone\":false,\"spawnError\":false,\"spilled\":false,\"log\":null}]，退不出时 code 为 null；旧文本前缀跟在同一行后面（正文一字不改）。",
             g_bash_path[0]
                 ? "本机已安装 git-bash：需要 Linux 风格命令或 .sh 脚本时请传 shell:\"gitbash\"（服务端自动定位 bash.exe，不会误用 WSL）。"
                 : "本机未检测到 git-bash。");
@@ -2754,8 +2943,7 @@ static void handle_message(const char *line) {
         snprintf(desc, sizeof(desc),
             "在 Windows 客户端执行一条命令（供 Remote-SSH/Linux 端的 agent 调用，跑在用户电脑的 Windows 上）。"
             "任何 Windows 命令/CLI/脚本皆可（如 dir、ipconfig、PowerShell、adb、esptool 等）；"
-            "结果返回 stdout/stderr 和退出码；超大输出自动落盘并只返回尾部与日志路径；"
-            "结构化字段 exitCode/timedOut/outputTruncated/spillPath 在 structuredContent 里。"
+            "结果返回 stdout/stderr，首行是机器可读的 JSON 哨兵（[exit-json: {\"code\",\"ms\",\"shell\",\"timedOut\",\"cancelled\",\"clientGone\",\"spawnError\",\"spilled\",\"log\"}]，无法确定退出码时 code 为 null），旧文本前缀跟在同一行后面；超大输出自动落盘并只返回尾部与日志路径（标注 outputTruncated/spillPath）；"
             "参数: command(必填, Windows 命令字符串, 支持 && 和管道), timeout_ms(可选, 超时毫秒, 默认 30000, 上限 24h), "
             "cwd(可选, 工作目录, 如 D:\\proj\\app；不传则用服务所在目录), "
             "shell(可选, \"cmd\"(默认) / \"gitbash\" / \"powershell\"), "
@@ -2797,11 +2985,16 @@ static void handle_message(const char *line) {
         j_set(p6, "type", j_str("string"));
         j_set(p6, "description", j_str("写入子进程 stdin 的文本（可选，写完关闭）；适合喂 python/sqlite/补丁类命令"));
         j_set(props, "stdin", p6);
+        Json *p7 = j_obj();
+        j_set(p7, "type", j_str("number"));
+        j_set(p7, "description", j_str("只回传末尾 N 行（可选，缺省 0 = 全部）。完整输出仍会落盘（若超阈值），只是不塞进上下文；适合只要看最后几行的场景。流式显示始终全量，不受影响"));
+        j_set(props, "tail_lines", p7);
         j_set(schema, "properties", props);
         Json *req = j_arr();
         j_add(req, j_str("command"));
         j_set(schema, "required", req);
         j_set(t, "inputSchema", schema);
+        j_set(t, "annotations", tool_ann(0, 1));
         j_add(tools, t);
 
         /* ---- windows_fs_put ---- */
@@ -2813,7 +3006,7 @@ static void handle_message(const char *line) {
             "content 与 content_base64 二选一（content=文本按 UTF-8 写入; content_base64=base64 解码后写入，"
             "二进制或从 shell 拷贝的内容用它）；offset(可选, 写入起始字节偏移, 默认 0=创建或整文件覆盖; "
             ">0 需文件已存在，用于分块续传)。单次最多 4MB；大文件分块：首块 offset=0，之后 offset=已写入总字节数。"
-            "返回 structuredContent {path, bytesWritten, offset, size}。"));
+            "返回文本确认：写入字节数（offset）、文件当前大小。"));
         Json *sp = j_obj();
         j_set(sp, "type", j_str("object"));
         Json *pp = j_obj();
@@ -2833,6 +3026,7 @@ static void handle_message(const char *line) {
         Json *rp = j_arr(); j_add(rp, j_str("path"));
         j_set(sp, "required", rp);
         j_set(tp, "inputSchema", sp);
+        j_set(tp, "annotations", tool_ann(0, 0));
         j_add(tools, tp);
 
         /* ---- windows_fs_get ---- */
@@ -2841,7 +3035,7 @@ static void handle_message(const char *line) {
         j_set(tg, "description", j_str(
             "读取 Windows 文件内容（二进制安全）。参数: path(必填); offset(可选, 默认 0); "
             "length(可选, 单次最多 4MB, 超出自动截断); as(可选, \"base64\"(默认, 无损) 或 \"text\")。"
-            "content[0].text 为数据本身；structuredContent {path, size, offset, bytesRead, eof, as}；"
+            "content[0].text 为数据本身；content[1] 为元数据行 [win-exec meta]（size/offset/bytesRead/eof/as）；"
             "eof=false 时以 offset+bytesRead 作为下一次 offset 续读。二进制/大文件用 base64；"
             "text 仅适合文本文件（自动做编码探测，GBK/UTF-8 混排可正确解码）。"));
         Json *sg = j_obj();
@@ -2863,6 +3057,7 @@ static void handle_message(const char *line) {
         Json *rg = j_arr(); j_add(rg, j_str("path"));
         j_set(sg, "required", rg);
         j_set(tg, "inputSchema", sg);
+        j_set(tg, "annotations", tool_ann(1, 0));
         j_add(tools, tg);
 
         /* ---- windows_bg_start ---- */
@@ -2892,6 +3087,7 @@ static void handle_message(const char *line) {
         Json *rbs = j_arr(); j_add(rbs, j_str("command"));
         j_set(sbs, "required", rbs);
         j_set(tbs, "inputSchema", sbs);
+        j_set(tbs, "annotations", tool_ann(0, 0));
         j_add(tools, tbs);
 
         /* ---- windows_bg_poll ---- */
@@ -2901,7 +3097,7 @@ static void handle_message(const char *line) {
             "取后台作业的增量输出与状态。参数: job_id(必填, 形如 \"bg1\"), "
             "wait_ms(可选, 0-30000：等新输出或作业退出最多这么久，默认 0=立即返回；等长任务结束建议 10000-30000), "
             "max_bytes(可选, 单次最多返回字节, 默认 65536, 上限 1MB)。"
-            "content[0].text = 自上次 poll 以来的新增输出；structuredContent: {jobId, running, exitCode, killed, newBytes, totalBytes, unreadBytes, logPath, elapsedMs}。"));
+            "content[0].text = 自上次 poll 以来的新增输出；content[1] 为状态行 [bg]（jobId/running/exitCode/killed/newBytes/totalBytes/unreadBytes/elapsedMs/logPath）。"));
         Json *sbp = j_obj();
         j_set(sbp, "type", j_str("object"));
         Json *pbp = j_obj();
@@ -2918,6 +3114,7 @@ static void handle_message(const char *line) {
         Json *rbp = j_arr(); j_add(rbp, j_str("job_id"));
         j_set(sbp, "required", rbp);
         j_set(tbp, "inputSchema", sbp);
+        j_set(tbp, "annotations", tool_ann(1, 0));
         j_add(tools, tbp);
 
         /* ---- windows_bg_kill ---- */
@@ -2934,6 +3131,7 @@ static void handle_message(const char *line) {
         Json *rbk = j_arr(); j_add(rbk, j_str("job_id"));
         j_set(sbk, "required", rbk);
         j_set(tbk, "inputSchema", sbk);
+        j_set(tbk, "annotations", tool_ann(0, 1));
         j_add(tools, tbk);
 
         /* ---- windows_bg_list ---- */
@@ -2944,6 +3142,7 @@ static void handle_message(const char *line) {
         j_set(sbl, "type", j_str("object"));
         j_set(sbl, "properties", j_obj());
         j_set(tbl, "inputSchema", sbl);
+        j_set(tbl, "annotations", tool_ann(1, 0));
         j_add(tools, tbl);
 
         /* ---- windows_env ---- */
@@ -2952,17 +3151,24 @@ static void handle_message(const char *line) {
         j_set(ten, "description", j_str(
             "Windows 环境快照（开工摸底用，一次拿全）：OS/版本/架构/主机/用户/是否管理员；"
             "git-bash、pwsh、Windows PowerShell 5.1 路径；常用工具链（python/node/git/adb/esptool/ssh/curl/tar/gcc）的 PATH 存在性；"
-            "串口列表（COM#）；固定磁盘余量；系统代理。无参数。"));
+            "串口列表（COM#）；固定磁盘余量；WSL 发行版；系统代理。无参数。"));
         Json *sen = j_obj();
         j_set(sen, "type", j_str("object"));
         j_set(sen, "properties", j_obj());
         j_set(ten, "inputSchema", sen);
+        j_set(ten, "annotations", tool_ann(1, 0));
         j_add(tools, ten);
 
         j_set(r, "tools", tools);
         send_json(resp_result(id, r));
     } else if (strcmp(m, "tools/call") == 0) {
         handle_tools_call(id, params);
+        /* 调用结束信号（与开头 [call] 配对；扩展据此精确控制活动指示——长命令期间保持亮，不靠定时猜）。
+           仅 HTTP 模式发：唯一听众是拉起本进程的扩展；stdio 模式下 stderr 会被客户端记进日志，别噪 */
+        if (g_http_mode) {
+            fprintf(stderr, "[done]\n");
+            fflush(stderr);
+        }
     } else {
         send_json(resp_error(id, -32601, "method not found"));
     }
@@ -3164,7 +3370,8 @@ static DWORD WINAPI http_client_serve(LPVOID arg) {
         char expected[512];
         snprintf(expected, sizeof(expected), "Bearer %s", g_token);
         if (strcmp(auth_buf, expected) != 0) {
-            const char *e = "{\"error\":\"unauthorized\"}";
+            /* 401 带人话提示：agent（尤其服务器端 Claude Code）拿到 401 时能自己走修复路径，而不是反复重试 */
+            const char *e = "{\"error\":\"unauthorized\",\"hint\":\"token mismatch: the project .mcp.json is stale or the Authorization header is wrong. Fix: reopen the project window on Windows so the extension resyncs the file (the SSH tunnel only exists while VS Code is connected), or run command 'WinExec MCP: Regenerate HTTP token' and re-sync; check that the header is exactly 'Bearer <token>'.\"}";
             http_send(s, 401, "Unauthorized", "application/json", e, (int)strlen(e), origin_buf, NULL);
             closesocket(s);
             return 0;
