@@ -80,7 +80,7 @@ SSH RemoteForward（`winExecMcp.ssh.localPort`，默认 28848 → Windows `127.0
 
 | 键 | 默认值 | 含义 |
 |---|---|---|
-| `stdio.enabled` | true | 在用户级 mcp.json 注册 stdio MCP server |
+| `stdio.enabled` | false | 开启后才在用户级 mcp.json 注册 stdio MCP server（**默认关闭**，不开启不写入；WSL / 本地窗口需要它） |
 | `http.enabled` | true | HTTP 服务开关（仅远端窗口） |
 | `http.port` | 38848 | HTTP 监听端口 |
 | `http.token` | *(自动)* | **Bearer token —— 留空即可**：首次激活生成随机 token 并持久化；需要固定 token 时再显式设置 |
@@ -229,7 +229,7 @@ SSH tunnel, no firewall/LAN-IP dependency.
 
 | key | default | meaning |
 |---|---|---|
-| `stdio.enabled` | true | register the stdio MCP server in user mcp.json |
+| `stdio.enabled` | false | opt-in: register the stdio MCP server in the user-level mcp.json (**off by default**; nothing is written until enabled; needed for WSL / local windows) |
 | `http.enabled` | true | HTTP service switch (remote windows only) |
 | `http.port` | 38848 | HTTP listen port |
 | `http.token` | *(auto)* | **Bearer token — leave empty**: a random token is generated on first activation and persisted. Set one explicitly if you need a fixed token. |

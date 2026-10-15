@@ -154,15 +154,14 @@ function projectHttpEntry(cfg) {
     };
 }
 
-// 用户级 mcp.json：只保证 stdio 条目，并清理 http 历史残留
+// 用户级 mcp.json：只按 stdio 开关维护 stdio 条目，并清理 http 历史残留
 // （http 条目一旦进入用户级，VS Code 的 MCP 网关会绑定其回环端口，遮蔽 exe 并与
 //   SSH 隧道/外部客户端冲突——http 只属于项目级注册与外部客户端）
-// SSH 远端窗口不注册 stdio（无论开关如何）：stdio + 项目 .mcp.json 的 http 同时在 =
-//   agent 看到两份相同的工具；SSH 场景 http 条目已覆盖内建 agent。WSL/本地窗口照旧
+// stdio 通道自 0.6.2 起**默认关闭**：不开启就不会写入任何东西；曾经写入的（老版本同意弹窗
+//   自动开的）会被主动清除——否则“默认不带 stdio”的语义会因为残留而失效
 // 容器兼容：VS Code 用 servers；Trae 等 fork 用 Claude Code 风格的 mcpServers——文件里存在哪个就维护哪个
 function ensureUserMcp(context, cfg) {
     const p = userMcpPath(context);
-    const sshRemote = isSshRemote();
     // 文件不存在（全新用户/卸载后重装）不是错误：视为空配置，走下方"按需创建"流程；
     // 仅"读到了内容却解析失败"（可能含注释）才提示手动配置——避免把 ENOENT 误报成解析失败
     let raw = '';
@@ -188,7 +187,11 @@ function ensureUserMcp(context, cfg) {
     }
     const containers = ['servers', 'mcpServers'].filter((k) => doc[k]);
     let changed = false;
-    if (!sshRemote && cfg.get('stdio.enabled', false)) {
+    // 判定**只看开关**，与窗口类型无关：① 开关为真才写（含 stdio.enabled 显式打开）；
+    // ② 开关为假就删掉已有条目。与窗口类型解耦是刻意的：用户级 mcp.json 是所有窗口共用的一份，
+    // 若按窗口增删，本地窗口写、SSH 窗口删，同一文件来回拉锯 → 每次激活都 changed → 每次都弹“需重载窗口”。
+    // 权衡：开关开着时 SSH 窗口也会注册 stdio（与项目 .mcp.json 的 http 条目重复工具）——见设置说明。
+    if (cfg.get('stdio.enabled', false)) {
         for (const k of containers) {
             const want = k === 'mcpServers'
                 ? { command: serviceExe(context), args: [] }
@@ -198,11 +201,14 @@ function ensureUserMcp(context, cfg) {
                 changed = true;
             }
         }
+    } else {
+        for (const k of containers) {
+            if (doc[k][STDIO_ID]) {
+                delete doc[k][STDIO_ID];
+                changed = true;
+            }
+        }
     }
-    // 注意：**不**按窗口类型增删 stdio 条目 —— 用户级 mcp.json 是所有窗口共用的一份：
-    // 本地窗口写进去、SSH 窗口又删掉，同一文件来回拉锯 → 每次激活都 changed →
-    // 每次都弹"需重载窗口"。stdio 条目带 location:'local'，SSH 窗口本来就不用它
-    // （同名 server 由工作区 .mcp.json 的 http 条目覆盖），留着无害。
     for (const k of containers) {
         if (doc[k][HTTP_ID] && isOurEntry(HTTP_ID, doc[k][HTTP_ID])) {
             delete doc[k][HTTP_ID];
@@ -817,7 +823,7 @@ const CONSENT_BASIC = vscode.l10n.t('VS Code only');
 
 async function askConsent(context) {
     const pick = await vscode.window.showWarningMessage(
-        vscode.l10n.t('WinExec MCP needs your consent before changing any configuration. Choose the scope:\n· {0}: register the user-level mcp.json (stdio); Remote-SSH windows start and connect to the local HTTP service automatically; append to ~/.ssh/config (a separate Host block, the original file is backed up first); write the project-root .mcp.json into the current project (with the Bearer token) - server-side Claude Code / Cursor etc. connect back through the SSH loopback\n· {1}: only the first two items, enough for the built-in VS Code agent; the external agent can be added later at any time with the command \'WinExec MCP: Configure server-side agent\'', CONSENT_FULL, CONSENT_BASIC),
+        vscode.l10n.t('WinExec MCP needs your consent before changing any configuration. Choose the scope:\n· {0}: Remote-SSH windows start and connect to the local HTTP service automatically; append to ~/.ssh/config (a separate Host block, the original file is backed up first); write the project-root .mcp.json into the current project (with the Bearer token) - server-side Claude Code / Cursor etc. connect back through the SSH loopback\n· {1}: start and connect the local HTTP service only (enough for the built-in VS Code agent); SSH forwarding and project registration stay untouched and can be added later with the command \'WinExec MCP: Configure server-side agent\'\nNeither choice touches the user-level mcp.json - the stdio channel is OFF by default; enable it explicitly with the command \'WinExec MCP: Register user mcp.json\' (needed for WSL / local windows)', CONSENT_FULL, CONSENT_BASIC),
         { modal: true }, CONSENT_FULL, CONSENT_BASIC, vscode.l10n.t('Not now'));
     if (pick !== CONSENT_FULL && pick !== CONSENT_BASIC) {
         await context.globalState.update(CONSENT_KEY, false);
@@ -825,7 +831,7 @@ async function askConsent(context) {
     }
     await context.globalState.update(CONSENT_KEY, true);
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
-    await cfg.update('stdio.enabled', true, vscode.ConfigurationTarget.Global);
+    // 同意 ≠ 注册 stdio：stdio 通道自 0.6.2 起默认关闭，只由显式设置/命令打开（见 ensureUserMcp）
     await cfg.update('http.enabled', true, vscode.ConfigurationTarget.Global);
     if (pick === CONSENT_FULL) {
         await enableExternalSetup(context); // 完整配置：外部 agent 链路全开
@@ -966,6 +972,20 @@ function activate(context) {
     outChannel = vscode.window.createOutputChannel('WinExec MCP');
     context.subscriptions.push(outChannel);
     logMsg('activate v' + context.extension.packageJSON.version + (vscode.env.remoteName ? ' remote=' + vscode.env.remoteName : ' local') + ' pid=' + process.pid + ' ui=v5 (icons only, data-driven blink)');
+    // 0.6.2 一次性迁移：stdio 通道改为“默认关闭、显式注册”。旧版同意弹窗会把 stdio.enabled 写成
+    // true（global），那不是用户的明确选择 —— 清掉它（workspace 级不动），随后 ensureUserMcp
+    // 会按新规则移除用户级 mcp.json 里的残留条目。
+    if (!context.globalState.get('stdioDefaultOffMigrated')) {
+        (async () => {
+            const c0 = vscode.workspace.getConfiguration('winExecMcp');
+            const insp = c0.inspect('stdio.enabled');
+            if (insp && insp.globalValue === true) {
+                await c0.update('stdio.enabled', undefined, vscode.ConfigurationTarget.Global);
+                logMsg('migration: cleared stdio.enabled (stdio channel is off by default now)');
+            }
+            await context.globalState.update('stdioDefaultOffMigrated', true);
+        })().catch(() => { });
+    }
     const cfg = vscode.workspace.getConfiguration('winExecMcp');
     // 迁移：0.3.5 起移除 ssh.autoForward / project.autoRegister 两个设置，
     // 曾显式设为 false 的转为内部“不启用”记录（避免把用户主动关过的功能又静默打开）

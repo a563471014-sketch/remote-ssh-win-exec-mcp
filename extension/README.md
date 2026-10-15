@@ -13,7 +13,7 @@
 ### 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.6.1.vsix
+code --install-extension win-exec-mcp-0.6.2.vsix
 ```
 
 → **Reload Window** → 首次激活弹窗，按用途二选一：
@@ -67,7 +67,7 @@ UI text follows the VS Code display language (English / Simplified Chinese); no 
 ### Install and go
 
 ```
-code --install-extension win-exec-mcp-0.6.1.vsix
+code --install-extension win-exec-mcp-0.6.2.vsix
 ```
 
 → **Reload Window** → pick one of the two scopes in the consent dialog:
