@@ -982,6 +982,9 @@ function activate(context) {
             if (insp && insp.globalValue === true) {
                 await c0.update('stdio.enabled', undefined, vscode.ConfigurationTarget.Global);
                 logMsg('migration: cleared stdio.enabled (stdio channel is off by default now)');
+                // 立刻按新值收敛一次：这个 await 期间本窗口的 autoSetup 可能已按旧值写入了条目，
+                // 不补这一下就要等下一次激活才删（用户会看到"说了默认关，条目却还在"）。
+                ensureUserMcp(context, vscode.workspace.getConfiguration('winExecMcp'));
             }
             await context.globalState.update('stdioDefaultOffMigrated', true);
         })().catch(() => { });
