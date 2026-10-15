@@ -960,8 +960,8 @@ typedef struct {
 
 #define MAX_OUTPUT (16 * 1024 * 1024) /* 内存缓冲上限；超出后改为边跑边写落盘文件，不再丢弃（仍需继续排空管道，防止子进程写满管道阻塞） */
 
-/* 首行机器可读哨兵：所有结束路径（正常/超时/取消/断连/spawn 失败/落盘）共用同一 schema，
-   下游不必再用正则猜；旧的文本前缀按原样跟在同一行后面，过渡期兼容既有解析。 */
+/* 首行机器可读哨兵：所有结束路径（正常/超时/取消/断连/spawn 失败/落盘）共用同一 schema。
+   （0.6.1 起只留 JSON，过渡期的旧文本前缀 [exit: N | ms] [shell: x] 已撤：下游均已迁移） */
 static void json_escape_path(const char *src, char *dst, size_t cap) {
     size_t w = 0;
     if (!src) { if (cap >= 5) strcpy(dst, "null"); else if (cap) dst[0] = 0; return; }
@@ -975,24 +975,24 @@ static void json_escape_path(const char *src, char *dst, size_t cap) {
     dst[w] = 0;
 }
 
-static char *exit_json_line(const RunResult *rr, unsigned long dur, const char *shell_id, const char *prefix) {
+static char *exit_json_line(const RunResult *rr, unsigned long dur, const char *shell_id) {
     char code[24], log[2100];
     if (rr->spawn_err || rr->timed_out || rr->aborted) strcpy(code, "null");
     else sprintf(code, "%d", rr->exit_code);
     json_escape_path(rr->spill_path, log, sizeof(log));
-    size_t cap = strlen(prefix) + strlen(log) + 320;
+    size_t cap = strlen(log) + 320;
     char *out = (char *)malloc(cap);
     if (!out) return NULL;
     snprintf(out, cap,
         "[exit-json: {\"code\":%s,\"ms\":%lu,\"shell\":\"%s\",\"timedOut\":%s,\"cancelled\":%s,"
-        "\"clientGone\":%s,\"spawnError\":%s,\"spilled\":%s,\"log\":%s}] %s",
+        "\"clientGone\":%s,\"spawnError\":%s,\"spilled\":%s,\"log\":%s}]",
         code, dur, shell_id,
         rr->timed_out ? "true" : "false",
         rr->aborted == 1 ? "true" : "false",
         rr->aborted == 2 ? "true" : "false",
         rr->spawn_err ? "true" : "false",
         rr->spill_path ? "true" : "false",
-        log, prefix);
+        log);
     return out;
 }
 
@@ -2835,11 +2835,11 @@ static void handle_tools_call(Json *id, Json *params) {
             text = spill_repl;
             spill_repl = NULL;
         }
-        /* 首行换成机器可读的 JSON 哨兵（旧文本前缀保留在同一行后面，兼容既有解析）。
+        /* 首行换成机器可读的 JSON 哨兵（0.6.1 起不带旧文本前缀）。
            放最后做：此时 spill 与 tail_lines 都已定型（spilled/log 字段要准）。 */
         {
             const char *shell_id = use_bash ? "gitbash" : use_ps ? (g_pwsh_path[0] ? "pwsh" : "powershell") : "cmd";
-            char *json_line = exit_json_line(&rr, dur, shell_id, prefix);
+            char *json_line = exit_json_line(&rr, dur, shell_id);
             if (json_line) {
                 char *nt = replace_first_line(text, json_line);
                 free(json_line);
@@ -2915,7 +2915,7 @@ static void handle_message(const char *line) {
             "经验法则：①预计超过 ~1 分钟的命令（安装/编译/长测试）改用 windows_bg_start + windows_bg_poll 循环（wait_ms 建议 10000-30000，直到 running=false）；"
             "②输出超过 512KB 时结果只含尾部与 spillPath，需要完整内容用 windows_fs_get 读该文件；"
             "③长命令给足 timeout_ms（默认仅 30 秒，超时会杀整棵进程树）；"
-            "④结果首行是机器可读哨兵 [exit-json: {\"code\":0,\"ms\":625,\"shell\":\"pwsh\",\"timedOut\":false,\"cancelled\":false,\"clientGone\":false,\"spawnError\":false,\"spilled\":false,\"log\":null}]，退不出时 code 为 null；旧文本前缀跟在同一行后面（正文一字不改）。",
+            "④结果首行是机器可读哨兵 [exit-json: {\"code\":0,\"ms\":625,\"shell\":\"pwsh\",\"timedOut\":false,\"cancelled\":false,\"clientGone\":false,\"spawnError\":false,\"spilled\":false,\"log\":null}]，其后紧跟原样的 stdout/stderr；code 为 null 表示命令被终止或未启动（看 timedOut/cancelled/clientGone/spawnError）。",
             g_bash_path[0]
                 ? "本机已安装 git-bash：需要 Linux 风格命令或 .sh 脚本时请传 shell:\"gitbash\"（服务端自动定位 bash.exe，不会误用 WSL）。"
                 : "本机未检测到 git-bash。");
@@ -2943,7 +2943,7 @@ static void handle_message(const char *line) {
         snprintf(desc, sizeof(desc),
             "在 Windows 客户端执行一条命令（供 Remote-SSH/Linux 端的 agent 调用，跑在用户电脑的 Windows 上）。"
             "任何 Windows 命令/CLI/脚本皆可（如 dir、ipconfig、PowerShell、adb、esptool 等）；"
-            "结果返回 stdout/stderr，首行是机器可读的 JSON 哨兵（[exit-json: {\"code\",\"ms\",\"shell\",\"timedOut\",\"cancelled\",\"clientGone\",\"spawnError\",\"spilled\",\"log\"}]，无法确定退出码时 code 为 null），旧文本前缀跟在同一行后面；超大输出自动落盘并只返回尾部与日志路径（标注 outputTruncated/spillPath）；"
+            "结果返回 stdout/stderr，首行是机器可读的 JSON 哨兵（[exit-json: {\"code\",\"ms\",\"shell\",\"timedOut\",\"cancelled\",\"clientGone\",\"spawnError\",\"spilled\",\"log\"}]，无法确定退出码时 code 为 null），正文从第二行开始；超大输出自动落盘并只返回尾部与日志路径（标注 outputTruncated/spillPath）；"
             "参数: command(必填, Windows 命令字符串, 支持 && 和管道), timeout_ms(可选, 超时毫秒, 默认 30000, 上限 24h), "
             "cwd(可选, 工作目录, 如 D:\\proj\\app；不传则用服务所在目录), "
             "shell(可选, \"cmd\"(默认) / \"gitbash\" / \"powershell\"), "
