@@ -13,12 +13,12 @@
 ### 安装即用
 
 ```
-code --install-extension win-exec-mcp-0.5.1.vsix
+code --install-extension win-exec-mcp-0.5.4.vsix
 ```
 
 → **Reload Window** → 首次激活弹窗，按用途二选一：
 
-- **完整配置（含服务器端 agent）**：除 VS Code 内建 agent 外，同时追加 `~/.ssh/config` 的 RemoteForward（先备份）并向当前项目写入 `.vscode/mcp.json` / `.mcp.json`（含 token）—— 服务器端的 Claude Code / Cursor 等直接可用，无需手改任何文件
+- **完整配置（含服务器端 agent）**：除 VS Code 内建 agent 外，同时追加 `~/.ssh/config` 的 RemoteForward（先备份）并向当前项目写入根 `.mcp.json`（含 token；VS Code 与 Claude Code / Cursor 都读这一个文件，单一来源避免重复注册）—— 服务器端的 Claude Code / Cursor 等直接可用，无需手改任何文件
 - **仅 VS Code**：只注册用户级 `mcp.json` + 自动启动/连接本机 HTTP 服务；外部 agent 部分可随时用命令补齐（不会自动启用）
 
 > **授权一次，之后全自动**：点过「同意/完整配置」的用户（含从旧版本升级）在远端窗口会**自动维护** SSH RemoteForward 与项目注册（URL/token）：缺失就补、过期就改，修复后提示「已修复配置文件，需重载窗口生效」（未打开项目时项目注册等打开后自动完成）。选「仅 VS Code」或点过「暂不」则外部配置保持关闭；重新运行 `WinExec MCP: Enable / Re-run setup (consent)` 可随时改选。排查看「输出 → WinExec MCP」日志。
@@ -27,8 +27,8 @@ code --install-extension win-exec-mcp-0.5.1.vsix
 
 ### 双模式
 
-- **stdio（`win-exec-mcp`）**：注册到用户级 `mcp.json`（location: local），Windows 客户端拉起进程，走 Remote-SSH 通道 —— VS Code 内建 agent 可用
-- **http**：注册到项目级 `.vscode/mcp.json` / `.mcp.json`，默认 URL `http://127.0.0.1:<ssh.localPort>/mcp`（SSH 回环隧道，与 IP 无关；设置 `http.host` 后改为局域网直连）—— 供 VS Code 之外的客户端（Claude Code 等）使用；进程仅远端窗口自动拉起
+- **stdio（`win-exec-mcp`）**：注册到用户级 `mcp.json`（location: local），Windows 客户端拉起进程，走 Remote-SSH 通道 —— VS Code 内建 agent 可用；**Remote-SSH 窗口不注册**（http 条目已覆盖内建 agent，两个都在会重复工具），WSL / 本地窗口照旧
+- **http**：注册到项目根 `.mcp.json`（VS Code 1.102+ 与 Claude Code 等外部客户端都读它；不再写 `.vscode/mcp.json` —— 两个文件都写会被 VS Code 读两遍，工具出现重复），默认 URL `http://127.0.0.1:<ssh.localPort>/mcp`（SSH 回环隧道，与 IP 无关；设置 `http.host` 后改为局域网直连）—— 供 VS Code 之外的客户端（Claude Code 等）使用；进程仅远端窗口自动拉起
 - 工具：`windows_exec(command, timeout_ms?=30000, cwd?, shell?="cmd")`，支持 `&&` 、管道等 cmd 语法；`cwd` 指定工作目录（不传则用服务所在目录）；`shell:"gitbash"` 可用 git-bash 执行 Linux 风格命令 / .sh 脚 本（自动检测本机 git-bash，未安装时明确报错）
 - 文件互传：`windows_fs_put(path, content|content_base64, offset?)` / `windows_fs_get(path, offset?, length?, as?="base64")` —— 脚本/配置/固件/日志/二进制在 Linux ↔ Windows 间直传，不再受 32K 命令行上限限制；单次 ≤4MB，大文件按 `offset` 分块续传（`put` 父目录自动创建、`offset=0` 创建/覆盖；`get` 返回 `eof`，`as:"text"` 做编码探测）
 - 执行增强：`shell:"powershell"`（pwsh 7 优先、回退 5.1）；`env`（{"KEY":"VAL"} 叠加环境变量）；`stdin`（文本喂给子进程）；`windows_env` 工具一次摸清 OS/工具链/串口/磁盘/代理
@@ -48,6 +48,9 @@ code --install-extension win-exec-mcp-0.5.1.vsix
 - `WinExec MCP: 注册到本项目 / 从本项目移除注册` — 项目级 http 注册（默认 URL 走 SSH 隧道 `127.0.0.1:28848`；设置 `http.host` 后为局域网直连，供 Linux 侧/外部客户端连接）
 - `WinExec MCP: Start / Stop HTTP service`
 - `WinExec MCP: 修复防火墙权限（管理员）` — 清除 win-exec 的防火墙阻止规则、放行固定路径并清理残留进程（UAC 确认；完成后重载窗口）
+- `WinExec MCP: 诊断` — 把版本/端口/probe 结果/mcp 注册状态/ssh 转发状态一次性落到输出通道，报障贴一段就够
+- `WinExec MCP: 重新生成 HTTP token` — 换 token 并同步全部已注册项目的 .mcp.json
+- **状态栏**：远端窗口显示服务健康（绿=运行/黄=启动中/红=不可用），点击出菜单（启停/诊断/修复/注册/token）
 
 ### 设置
 
@@ -64,12 +67,12 @@ UI text follows the VS Code display language (English / Simplified Chinese); no 
 ### Install and go
 
 ```
-code --install-extension win-exec-mcp-0.5.1.vsix
+code --install-extension win-exec-mcp-0.5.4.vsix
 ```
 
 → **Reload Window** → pick one of the two scopes in the consent dialog:
 
-- **Full setup (incl. server-side agent)**: besides the VS Code built-in agent, it also appends the SSH `RemoteForward` to `~/.ssh/config` (backed up first) and writes `.vscode/mcp.json` / `.mcp.json` (with the Bearer token) into the current project — server-side Claude Code / Cursor etc. work right away, no manual editing.
+- **Full setup (incl. server-side agent)**: besides the VS Code built-in agent, it also appends the SSH `RemoteForward` to `~/.ssh/config` (backed up first) and writes the project-root `.mcp.json` (with the Bearer token; VS Code and Claude Code / Cursor all read this single file, so no duplicate registration) — server-side Claude Code / Cursor etc. work right away, no manual editing.
 - **VS Code only**: only registers the user-level `mcp.json` and starts/connects the local HTTP service; the external agent part can be added later at any time with a command (it is never enabled automatically).
 
 > **Consent once, then fully automatic**: once you picked 同意/完整配置 (including consent given in older versions), remote windows **auto-maintain** the SSH `RemoteForward` and the project registration (URL/token): missing entries are added, stale ones rewritten, and you only get a "configuration files repaired; reload the window" notice. If no project is open, project registration happens automatically once you open one. Picking **VS Code only** or **Not now** keeps the external part off; re-run `WinExec MCP: Enable / Re-run setup (consent)` to change your mind. Troubleshooting logs live in **Output → WinExec MCP**.
@@ -87,7 +90,7 @@ The extension only modifies files after you answer the consent dialog. Once auth
 | `<user-data>/User/mcp.json` | Adds/removes its own `win-exec-mcp` stdio server entry (bundled exe, runs locally) | **Off** until consent |
 | Local process | Starts `win-exec-mcp.exe --http` listening on `127.0.0.1:38848` (Bearer-token protected, token auto-generated and stored locally) when a Remote-SSH window opens | **Off** until consent |
 | `~/.ssh/config` | Appends one `Host` block with `RemoteForward 127.0.0.1:28848 → 127.0.0.1:38848` (backs up the file as `config.bak-winexec` first; never touches existing entries) | **Off** until authorized; maintained automatically afterwards (opt-out: 仅 VS Code / 暂不) |
-| Project `.vscode/mcp.json` + `.mcp.json` | Adds its HTTP server entry for agent clients (contains the Bearer token) | **Off** until authorized; same automatic maintenance |
+| Project root `.mcp.json` | Adds its HTTP server entry for agent clients (contains the Bearer token); the legacy `.vscode/mcp.json` entry is cleaned up automatically | **Off** until authorized; same automatic maintenance |
 
 ### Security model
 
@@ -97,8 +100,8 @@ The extension only modifies files after you answer the consent dialog. Once auth
 
 ### Dual MCP modes
 
-- **stdio (`win-exec-mcp`)**: registered in the user-level `mcp.json` (`location: local`); the Windows client spawns the process and it is reached over the Remote-SSH channel — this is what the VS Code built-in agent uses.
-- **http**: registered in the project `.vscode/mcp.json` / `.mcp.json`; default URL `http://127.0.0.1:<ssh.localPort>/mcp` (SSH loopback tunnel, independent of LAN IPs; set `http.host` for direct LAN access) — for clients outside VS Code (Claude Code etc.). The process is auto-started only in remote windows.
+- **stdio (`win-exec-mcp`)**: registered in the user-level `mcp.json` (`location: local`); the Windows client spawns the process and it is reached over the Remote-SSH channel — this is what the VS Code built-in agent uses. **Not registered in Remote-SSH windows** (the http entry already covers the built-in agent; keeping both duplicates the tools); WSL / local windows are unaffected.
+- **http**: registered in the project root `.mcp.json` (read by VS Code 1.102+ and external clients alike; `.vscode/mcp.json` is no longer written — writing both made VS Code see the server twice, duplicating the tools); default URL `http://127.0.0.1:<ssh.localPort>/mcp` (SSH loopback tunnel, independent of LAN IPs; set `http.host` for direct LAN access) — for clients outside VS Code (Claude Code etc.). The process is auto-started only in remote windows.
 - Tool: `windows_exec(command, timeout_ms?=30000, cwd?, shell?="cmd")` — cmd syntax including `&&` and pipes; `cwd` sets the working directory (defaults to the service's own directory); `shell:"gitbash"` runs Linux-style commands / `.sh` scripts through git-bash (auto-detected; a clear error is reported when git-bash is not installed).
 - File transfer: `windows_fs_put(path, content|content_base64, offset?)` / `windows_fs_get(path, offset?, length?, as?="base64")` — move scripts/configs/firmware/logs/binaries between Linux ↔ Windows directly, free of the 32K command-line limit; ≤4MB per call, larger files chunked via `offset` (put auto-creates parent dirs and `offset=0` creates/overwrites; get reports `eof`; `as:"text"` applies encoding detection).
 - Exec enhancements: `shell:"powershell"` (pwsh 7 preferred, falls back to 5.1); `env` (`{"KEY":"VAL"}` overlay); `stdin` (text fed to the child); `windows_env` tool for a one-shot OS/toolchain/COM/disks/proxy overview.
@@ -118,6 +121,9 @@ The extension only modifies files after you answer the consent dialog. Once auth
 - `WinExec MCP: Register in this project / Remove from this project` — project-level http registration (SSH-tunnel URL `127.0.0.1:28848` by default; direct LAN when `http.host` is set, for clients on the Linux side)
 - `WinExec MCP: Start / Stop HTTP service`
 - `WinExec MCP: Fix firewall permissions (administrator)` — clears win-exec firewall block rules, allows the stable path and kills leftover processes (UAC confirmation; reload afterwards)
+- `WinExec MCP: Diagnostics` — dumps version/port/probe results/mcp registrations/ssh forward status into the output channel in one shot
+- `WinExec MCP: Regenerate HTTP token` — rotates the token and resyncs all registered projects' .mcp.json
+- **Status bar**: remote windows show service health (green=running / yellow=starting / red=down); click for a menu (start/stop, diagnostics, repair, registration, token)
 
 ### Settings
 

@@ -2,7 +2,7 @@
 	"name": "win-exec-mcp",
 	"displayName": "WinExec MCP for Remote-SSH",
 	"description": "%ext.description%",
-	"version": "0.5.1",
+	"version": "0.5.4",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/a563471014-sketch/remote-ssh-win-exec-mcp"
@@ -57,6 +57,18 @@
 			{
 				"command": "winExecMcp.fixFirewall",
 				"title": "%cmd.fixFirewall.title%"
+			},
+			{
+				"command": "winExecMcp.menu",
+				"title": "%cmd.menu.title%"
+			},
+			{
+				"command": "winExecMcp.diagnostics",
+				"title": "%cmd.diagnostics.title%"
+			},
+			{
+				"command": "winExecMcp.regenerateToken",
+				"title": "%cmd.regenerateToken.title%"
 			}
 		],
 		"configuration": {

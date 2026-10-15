@@ -20,6 +20,10 @@ let child = null;
 let autoToken = null;
 let watchdog = null; // 定时检查：服务被其他窗口关闭/崩溃时自动恢复
 let outChannel = null;
+let gContext = null; // activate 存下的 context（命令/事件回调里需要 globalState 时用）
+let statusItem = null; // 状态栏项
+let httpState = 'down'; // down | starting | live
+let staleExeWarned = false;
 
 // 输出面板日志（“输出 → WinExec MCP”），便于排查“到底跑没跑/修没修”
 function logMsg(...parts) {
@@ -73,7 +77,17 @@ function ensureStableExe(context) {
         }
         return dst;
     } catch (e) {
-        try { if (fs.existsSync(dst)) { logMsg('stable exe in use / update failed, keep existing: ' + (e && e.message)); return dst; } } catch (e2) { }
+        try {
+            if (fs.existsSync(dst)) {
+                logMsg('stable exe in use / update failed, keep existing: ' + (e && e.message));
+                if (!staleExeWarned) {
+                    staleExeWarned = true;
+                    vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('the bundled exe was updated but the running copy is locked; reload the window to switch to it'), vscode.l10n.t('Reload Window'))
+                        .then((pick) => { if (pick) vscode.commands.executeCommand('workbench.action.reloadWindow'); });
+                }
+                return dst;
+            }
+        } catch (e2) { }
         logMsg('stable exe unavailable, fallback to bundled copy: ' + (e && e.message));
         return src;
     }
@@ -138,9 +152,12 @@ function projectHttpEntry(cfg) {
 // 用户级 mcp.json：只保证 stdio 条目，并清理 http 历史残留
 // （http 条目一旦进入用户级，VS Code 的 MCP 网关会绑定其回环端口，遮蔽 exe 并与
 //   SSH 隧道/外部客户端冲突——http 只属于项目级注册与外部客户端）
+// SSH 远端窗口不注册 stdio（无论开关如何）：stdio + 项目 .mcp.json 的 http 同时在 =
+//   agent 看到两份相同的工具；SSH 场景 http 条目已覆盖内建 agent。WSL/本地窗口照旧
 // 容器兼容：VS Code 用 servers；Trae 等 fork 用 Claude Code 风格的 mcpServers——文件里存在哪个就维护哪个
 function ensureUserMcp(context, cfg) {
     const p = userMcpPath(context);
+    const sshRemote = isSshRemote();
     // 文件不存在（全新用户/卸载后重装）不是错误：视为空配置，走下方"按需创建"流程；
     // 仅"读到了内容却解析失败"（可能含注释）才提示手动配置——避免把 ENOENT 误报成解析失败
     let raw = '';
@@ -166,7 +183,7 @@ function ensureUserMcp(context, cfg) {
     }
     const containers = ['servers', 'mcpServers'].filter((k) => doc[k]);
     let changed = false;
-    if (cfg.get('stdio.enabled', false)) {
+    if (!sshRemote && cfg.get('stdio.enabled', false)) {
         for (const k of containers) {
             const want = k === 'mcpServers'
                 ? { command: serviceExe(context), args: [] }
@@ -324,28 +341,8 @@ async function registerProject() {
     const mEntry = { type: 'http', url: entry.url, headers: entry.headers };
     let changed = false;
 
-    // 1) .vscode/mcp.json（VS Code servers 格式）——幂等：已有且相同则跳过
-    // 不存在（FileNotFound）与空文件都视为空配置，直接走创建流程；仅"有内容但解析失败"才提示手动添加
-    let doc = {};
-    try {
-        const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(paths.file)).trim();
-        if (text) doc = JSON.parse(text);
-    } catch (e) {
-        if (e && e.code !== 'FileNotFound') {
-            vscode.window.showErrorMessage('WinExec MCP: ' + vscode.l10n.t('failed to parse {0} (it may contain comments), please add manually:\n{1}', paths.file.fsPath, JSON.stringify({ [HTTP_ID]: entry }, null, 2)));
-            return;
-        }
-    }
-    if (!doc.servers) doc.servers = {};
-    if (!sameHttpEntry(doc.servers[HTTP_ID], entry)) {
-        doc.servers[HTTP_ID] = entry;
-        await vscode.workspace.fs.createDirectory(paths.dir);
-        await vscode.workspace.fs.writeFile(paths.file, new TextEncoder().encode(JSON.stringify(doc, null, '\t')));
-        changed = true;
-    }
-
-    // 2) 项目根 .mcp.json（Claude Code mcpServers 格式，VS Code 1.102+ 也兼容）——幂等
-    // 与上同理：不存在/空文件按空配置处理
+    // 1) 项目根 .mcp.json（Claude Code mcpServers 格式，VS Code 1.102+ 也兼容）——唯一写入点。
+    // 不要再写 .vscode/mcp.json：VS Code 两个文件都读且不去重，会得到两份重复的工具
     const rootFile = vscode.Uri.joinPath(paths.dir, '..', '.mcp.json');
     let mdoc = {};
     try {
@@ -363,9 +360,31 @@ async function registerProject() {
         await vscode.workspace.fs.writeFile(rootFile, new TextEncoder().encode(JSON.stringify(mdoc, null, '\t')));
         changed = true;
     }
+    // token 风险提示：项目根 .mcp.json 含 Bearer token，而它通常会被 commit —— 一次性提醒
+    try {
+        await vscode.workspace.fs.stat(vscode.Uri.joinPath(paths.dir, '..', '.git'));
+        if (gContext && !gContext.globalState.get('tokenGitHintShown')) {
+            const notAgain = vscode.l10n.t("Don't show again");
+            vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('.mcp.json contains a Bearer token and this project looks like a git repository - consider adding .mcp.json to .gitignore or git update-index --skip-worktree'), notAgain)
+                .then((p2) => { if (p2 === notAgain) gContext.globalState.update('tokenGitHintShown', true); });
+        }
+    } catch (e) { } // 无 .git 或 stat 失败：非 git 项目，不提示
+
+    // 2) 清理历史遗留的 .vscode/mcp.json 条目（旧版本写入过 → 与根 .mcp.json 重复）
+    try {
+        const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(paths.file)).trim();
+        if (text) {
+            const doc = JSON.parse(text);
+            if (doc.servers && doc.servers[HTTP_ID]) {
+                delete doc.servers[HTTP_ID];
+                await vscode.workspace.fs.writeFile(paths.file, new TextEncoder().encode(JSON.stringify(doc, null, '\t')));
+                changed = true;
+            }
+        }
+    } catch (e) { }
 
     if (changed) {
-        noteRepaired(vscode.l10n.t('project registration (.vscode/mcp.json + .mcp.json)'));
+        noteRepaired(vscode.l10n.t('project registration (.mcp.json)'));
         setTimeout(autoStartHttpConnection, 3000);
     }
 }
@@ -494,6 +513,7 @@ async function trySelfHealPort(context, fromPort) {
                 logMsg('self-heal: switched to port ' + p);
                 await cfg.update('http.port', p, vscode.ConfigurationTarget.Global);
                 rewriteSshForwardPort(fromPort, p);
+                // 其他项目的 .mcp.json 不在这里改：各自窗口打开时 sweep 会按新设置重写
                 child = c;
                 httpSpawnFails = 0; httpNextTryAt = 0; blockedWarned = false;
                 try { await externalSetupSweep(context); } catch (e) { logMsg('self-heal sweep failed: ' + e.message); }
@@ -519,8 +539,9 @@ function startHttp(context) {
             // 端口有监听不等于我们的服务在跑（可能是别的程序占了这个端口）：探一次再判定
             if (Date.now() < httpNextTryAt || healingPort) return;
             probeOurHttp(port, 2000).then((r) => {
-                if (r === 'live') { httpSpawnFails = 0; httpNextTryAt = 0; blockedWarned = false; return; }
+                if (r === 'live') { setStatus('live'); httpSpawnFails = 0; httpNextTryAt = 0; blockedWarned = false; return; }
                 if (r === 'refused') return;
+                setStatus('down');
                 httpSpawnFails++;
                 logMsg('startHttp: port ' + port + ' is listening but not answering as a live HTTP service (probe=' + r + ', fail #' + httpSpawnFails + ')');
                 if (httpSpawnFails >= 3) trySelfHealPort(context, port).catch(() => { });
@@ -542,6 +563,7 @@ function startHttp(context) {
         // 原先 stdio:'ignore' 把它们全丢了，故障时只剩 probe=refused 无从定位。
         // token 走环境变量而不是命令行：进程列表/任务管理器里看不到它（--token 仍兼容）
         child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WINEXEC_TOKEN: currentToken(cfg) } });
+        setStatus('starting');
         if (child.stdout) child.stdout.on('data', (d) => logMsg('http[out] ' + String(d).replace(/[\r\n]+$/, '')));
         if (child.stderr) child.stderr.on('data', (d) => logMsg('http[err] ' + String(d).replace(/[\r\n]+$/, '')));
         child.on('error', (err) => vscode.window.showErrorMessage(vscode.l10n.t('WinExec MCP failed to start: {0}', err.message)));
@@ -549,7 +571,8 @@ function startHttp(context) {
         // 3 秒后复查：ok=正常；refused=进程没起来（退避重试）；timeout=回环被拦截（提示一键修复）
         setTimeout(() => {
             probePort(port, 1500).then((r) => {
-                if (r === 'ok') { httpSpawnFails = 0; httpNextTryAt = 0; blockedWarned = false; return; }
+                if (r === 'ok') { setStatus('live'); httpSpawnFails = 0; httpNextTryAt = 0; blockedWarned = false; return; }
+                setStatus('down');
                 if (r === 'timeout') noteFirewallBlocked(context, port);
                 httpSpawnFails++;
                 httpNextTryAt = Date.now() + Math.min(15000 * Math.pow(2, Math.min(httpSpawnFails - 1, 3)), 120000);
@@ -566,6 +589,93 @@ function startHttp(context) {
 
 function stopHttp() {
     if (child) { child.kill(); child = null; }
+    setStatus('down');
+}
+
+// —— 状态栏：远端窗口显示服务健康（绿=live / 黄=starting / 红=down），点击出菜单 ——
+function refreshStatusBar() {
+    const relevant = isSshRemote() || (child && child.exitCode === null);
+    if (!relevant) { if (statusItem) statusItem.hide(); return; }
+    if (!statusItem) {
+        statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+        statusItem.name = 'WinExec MCP';
+        statusItem.command = 'winExecMcp.menu';
+        if (gContext) gContext.subscriptions.push(statusItem);
+    }
+    const port = vscode.workspace.getConfiguration('winExecMcp').get('http.port', 38848);
+    if (httpState === 'live') {
+        statusItem.text = '$(plug) win-exec:' + port;
+        statusItem.backgroundColor = undefined;
+        statusItem.tooltip = vscode.l10n.t('WinExec MCP service is running on port {0}', String(port));
+    } else if (httpState === 'starting') {
+        statusItem.text = '$(sync~spin) win-exec:' + port;
+        statusItem.backgroundColor = undefined;
+        statusItem.tooltip = vscode.l10n.t('WinExec MCP service is starting on port {0}', String(port));
+    } else {
+        statusItem.text = '$(plug) win-exec:' + port;
+        statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+        statusItem.tooltip = vscode.l10n.t('WinExec MCP service is down (port {0}); click the status bar item for actions', String(port));
+    }
+    statusItem.show();
+}
+
+function setStatus(state) {
+    httpState = state;
+    refreshStatusBar();
+}
+
+async function showWinExecMenu() {
+    const t = (k) => vscode.l10n.t(k);
+    const running = !!(child && child.exitCode === null);
+    const items = [
+        { label: '$(server-process) ' + t(running ? 'Stop HTTP service' : 'Start HTTP service'), act: () => (running ? stopHttp() : startHttp(gContext)) },
+        { label: '$(info) ' + t('Diagnostics'), act: () => runDiagnostics().catch((e) => logMsg('diagnostics failed: ' + e.message)) },
+        { label: '$(shield) ' + t('Run repair (administrator)'), act: () => runFirewallFix(gContext) },
+        { label: '$(output) ' + t('Open Output'), act: () => { if (outChannel) outChannel.show(); } },
+        { label: '$(link) ' + t('Configure server-side agent (SSH forwarding + project registration)'), act: () => enableExternalSetup(gContext) },
+        { label: '$(add) ' + t('Register in this project'), act: () => registerProject().catch(() => { }) },
+        { label: '$(remove) ' + t('Remove from this project'), act: () => unregisterProject() },
+        { label: '$(key) ' + t('Regenerate token'), act: () => regenerateToken().catch((e) => logMsg('token regen failed: ' + e.message)) }
+    ];
+    const pick = await vscode.window.showQuickPick(items, { placeHolder: 'WinExec MCP' });
+    if (pick && pick.act) pick.act();
+}
+
+// —— token 轮换：换随机 token 并重启服务；各项目根 .mcp.json 不在这里改 ——
+// （token/端口都是设置驱动，各项目打开时的 externalSetupSweep 会按当前设置重写条目）
+async function regenerateToken() {
+    if (!gContext) return;
+    const token = crypto.randomBytes(8).toString('hex');
+    await gContext.globalState.update('httpToken', token);
+    logMsg('token regenerated');
+    stopHttp();
+    startHttp(gContext);
+    vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('token regenerated; reopen each registered project to resync its .mcp.json'));
+}
+
+// —— 一键诊断：把排障需要的全部事实落到输出通道，报障贴一段就够 ——
+async function runDiagnostics() {
+    const L = (s) => logMsg('[diag] ' + s);
+    const cfg = vscode.workspace.getConfiguration('winExecMcp');
+    const port = cfg.get('http.port', 38848);
+    const exe = serviceExe(gContext);
+    L('--- diagnostics begin ---');
+    L('extension: ' + (gContext && gContext.extension ? gContext.extension.packageJSON.version : '?') + ', app: ' + (vscode.env.appName || '?'));
+    L('remoteName: ' + (vscode.env.remoteName || '(local)') + ', sshHost: ' + (sshHost() || '(n/a)'));
+    L('exe: ' + exe + ' exists=' + fs.existsSync(exe));
+    L('http: enabled=' + cfg.get('http.enabled', false) + ' port=' + port + ' host=' + (cfg.get('http.host', '') || '(127.0.0.1)'));
+    L('port probe: ' + (await probePort(port, 1500)) + ', http probe: ' + (await probeOurHttp(port, 2000)));
+    L('spawn fails: ' + httpSpawnFails + ', state: ' + httpState);
+    try {
+        const doc = JSON.parse(fs.readFileSync(userMcpPath(gContext), 'utf8'));
+        const has = ['servers', 'mcpServers'].some((k) => doc[k] && doc[k][STDIO_ID]);
+        L('user mcp.json: stdio entry=' + (has ? 'yes' : 'no'));
+    } catch (e) { L('user mcp.json: unreadable (' + (e && e.message) + ')'); }
+    L('project registration: ' + (await projectFilesStatus(cfg)));
+    L('ssh forward: ' + sshForwardStatus(cfg));
+    L('--- diagnostics end ---');
+    if (outChannel) outChannel.show();
+    vscode.window.showInformationMessage('WinExec MCP: ' + vscode.l10n.t('diagnostics written to the output channel'));
 }
 
 // 回环连接超时 = 本机防火墙/安全软件把该程序的入站连接静默丢弃的典型特征（连 127.0.0.1 都连不上）。
@@ -639,7 +749,7 @@ const CONSENT_BASIC = vscode.l10n.t('VS Code only');
 
 async function askConsent(context) {
     const pick = await vscode.window.showWarningMessage(
-        vscode.l10n.t('WinExec MCP needs your consent before changing any configuration. Choose the scope:\n· {0}: register the user-level mcp.json (stdio); Remote-SSH windows start and connect to the local HTTP service automatically; append to ~/.ssh/config (a separate Host block, the original file is backed up first); write .vscode/mcp.json and .mcp.json into the current project (with the Bearer token) - server-side Claude Code / Cursor etc. connect back through the SSH loopback\n· {1}: only the first two items, enough for the built-in VS Code agent; the external agent can be added later at any time with the command \'WinExec MCP: Configure server-side agent\'', CONSENT_FULL, CONSENT_BASIC),
+        vscode.l10n.t('WinExec MCP needs your consent before changing any configuration. Choose the scope:\n· {0}: register the user-level mcp.json (stdio); Remote-SSH windows start and connect to the local HTTP service automatically; append to ~/.ssh/config (a separate Host block, the original file is backed up first); write the project-root .mcp.json into the current project (with the Bearer token) - server-side Claude Code / Cursor etc. connect back through the SSH loopback\n· {1}: only the first two items, enough for the built-in VS Code agent; the external agent can be added later at any time with the command \'WinExec MCP: Configure server-side agent\'', CONSENT_FULL, CONSENT_BASIC),
         { modal: true }, CONSENT_FULL, CONSENT_BASIC, vscode.l10n.t('Not now'));
     if (pick !== CONSENT_FULL && pick !== CONSENT_BASIC) {
         await context.globalState.update(CONSENT_KEY, false);
@@ -677,14 +787,6 @@ async function projectFilesStatus(cfg) {
         return text ? JSON.parse(text) : {};
     };
     try {
-        const doc = await readJson(paths.file);
-        const cur = doc.servers && doc.servers[HTTP_ID];
-        if (!cur) bump('missing');
-        else if (!sameHttpEntry(cur, entry)) bump('wrong');
-    } catch (e) {
-        bump(e && e.code === 'FileNotFound' ? 'missing' : 'broken');
-    }
-    try {
         const mdoc = await readJson(vscode.Uri.joinPath(paths.dir, '..', '.mcp.json'));
         const cur = mdoc.mcpServers && mdoc.mcpServers['win-exec-mcp'];
         if (!cur) bump('missing');
@@ -692,6 +794,11 @@ async function projectFilesStatus(cfg) {
     } catch (e) {
         bump(e && e.code === 'FileNotFound' ? 'missing' : 'broken');
     }
+    // 历史遗留：旧版本写进 .vscode/mcp.json 的条目 → 视为过期，触发 registerProject 清理
+    try {
+        const doc = await readJson(paths.file);
+        if (doc.servers && doc.servers[HTTP_ID]) bump('wrong');
+    } catch (e) { }
     return worst;
 }
 
@@ -765,8 +872,10 @@ function autoSetup(context) {
             const c2 = vscode.workspace.getConfiguration('winExecMcp');
             if (!c2.get('http.enabled', false)) return;
             const port = c2.get('http.port', 38848);
-            isPortListening(port).then((listening) => {
-                if (!listening) startHttp(context);
+            probeOurHttp(port, 2000).then((r) => {
+                if (r === 'live') { setStatus('live'); return; }
+                setStatus('down');
+                startHttp(context); // refused=没监听；dead=孤儿监听，startHttp 里的探测+自愈能处理
             });
         }, 15000);
     }
@@ -785,6 +894,7 @@ function autoSetup(context) {
 }
 
 function activate(context) {
+    gContext = context;
     outChannel = vscode.window.createOutputChannel('WinExec MCP');
     context.subscriptions.push(outChannel);
     logMsg('activate v' + context.extension.packageJSON.version + (vscode.env.remoteName ? ' remote=' + vscode.env.remoteName : ' local'));
@@ -825,6 +935,9 @@ function activate(context) {
         vscode.commands.registerCommand('winExecMcp.setupExternal', () => enableExternalSetup(context)),
         // 一键修复防火墙（管理员）：清除 win-exec 阻止规则、放行固定路径、清理残留进程
         vscode.commands.registerCommand('winExecMcp.fixFirewall', () => runFirewallFix(context)),
+        vscode.commands.registerCommand('winExecMcp.menu', () => showWinExecMenu()),
+        vscode.commands.registerCommand('winExecMcp.diagnostics', () => runDiagnostics().catch((e) => logMsg('diagnostics failed: ' + e.message))),
+        vscode.commands.registerCommand('winExecMcp.regenerateToken', () => regenerateToken().catch((e) => logMsg('token regen failed: ' + e.message))),
         vscode.commands.registerCommand('winExecMcp.setup', async () => {
             if (await askConsent(context)) autoSetup(context);
         })
@@ -847,6 +960,7 @@ function activate(context) {
     }));
     // 打开/添加项目后补做项目注册（没打开项目时 autoSetup 自动跳过，不报错）
     context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => autoSetup(context)));
+    refreshStatusBar();
 }
 
 function deactivate() {

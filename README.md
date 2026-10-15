@@ -48,7 +48,7 @@ Remote-SSH 场景里 agent 跑在 Linux，但很多东西只存在于 Windows �
 code --install-extension win-exec-mcp-<ver>.vsix
 ```
 
-→ Reload Window → 在同意弹窗里选 **仅 VS Code** 或 **完整配置（含服务器端 agent）**。完整配置同时追加 SSH RemoteForward 并写入项目 `.vscode/mcp.json` / `.mcp.json`，服务器端 Claude Code / Cursor 无需任何手动编辑即可用；之后也可随时用 `WinExec MCP: 配置服务器端 agent` 补齐。授权一次（含旧版本已同意）后，远端窗口会自动启用并修复整条链路，只有真的改了文件才提示重载。
+→ Reload Window → 在同意弹窗里选 **仅 VS Code** 或 **完整配置（含服务器端 agent）**。完整配置同时追加 SSH RemoteForward 并向项目根写入 `.mcp.json`（VS Code 与 Claude Code / Cursor 都读这一个文件，单一来源避免重复注册），服务器端 Claude Code / Cursor 无需任何手动编辑即可用；之后也可随时用 `WinExec MCP: 配置服务器端 agent` 补齐。授权一次（含旧版本已同意）后，远端窗口会自动启用并修复整条链路，只有真的改了文件才提示重载。
 
 **防火墙说明（为什么以前升级会坏）**：Windows 防火墙与安全套件按**程序路径**记忆网络授权 —— 每个新的扩展目录都像一个新程序（重新弹窗，更糟的是静默阻止：连回环连接都被丢包，表现为 "Waiting for server to respond to initialize" → "other side closed"）。自 **0.3.8** 起服务始终从固定路径 `%LOCALAPPDATA%\win-exec-mcp\bin\win-exec-mcp.exe` 运行（升级原地替换），放行一次即可长期有效。若服务连不上，运行命令 **`WinExec MCP: 修复防火墙权限（管理员）`**（或扩展目录里的 `fix-firewall.cmd`）：清除陈旧的 win-exec BLOCK 规则、为固定路径加放行、清理残留进程，然后重载窗口。若第三方安全套件（360、火绒、腾讯电脑管家…）用自己的网络过滤而不写 Windows 防火墙规则，请把固定路径加入它的信任/放行列表。
 
@@ -100,6 +100,7 @@ SSH RemoteForward（`winExecMcp.ssh.localPort`，默认 28848 → Windows `127.0
 - `WinExec MCP: 注册到本项目 / 从本项目移除注册`（项目级 http；默认 SSH 隧道 URL，设置 `http.host` 后为局域网 IP）
 - `WinExec MCP: Start / Stop HTTP service`
 - `WinExec MCP: 修复防火墙权限（管理员）`（清除 win-exec 防火墙阻止规则 + 放行固定路径；UAC 确认后重载）
+- `WinExec MCP: 诊断` / `重新生成 HTTP token`；远端窗口状态栏显示服务健康，点击出操作菜单
 
 ### 源码结构
 
@@ -168,7 +169,8 @@ code --install-extension win-exec-mcp-<ver>.vsix
 
 → Reload Window → pick a scope in the consent dialog: **仅 VS Code** or
 **完整配置（含服务器端 agent）**. The full option also appends the SSH
-RemoteForward and writes the project `.vscode/mcp.json` / `.mcp.json`, so
+RemoteForward and writes the project-root `.mcp.json` (read by both VS Code and
+Claude Code / Cursor, a single source of truth), so
 server-side Claude Code / Cursor connect without any manual editing. It can
 also be enabled later with `WinExec MCP: 配置服务器端 agent`. Once authorized
 (including consent given in older versions), remote windows auto-enable and
